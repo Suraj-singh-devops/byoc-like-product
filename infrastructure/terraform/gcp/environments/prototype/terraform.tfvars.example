@@ -1,0 +1,15 @@
+# The PRD's example cluster (section 15).
+project_id        = "customer-prod"
+region            = "asia-south1"
+zone              = "asia-south1-a"
+ha_zones          = ["asia-south1-a", "asia-south1-b", "asia-south1-c"]
+cluster_id        = "3f9a2c1e-0000-4000-8000-000000000001"
+cluster_name      = "production-search"
+name_prefix       = "production-search-3f9a"
+es_version        = "9.5.4"
+machine_type      = "e2-standard-8"
+node_count        = 3
+storage_gb        = 500
+storage_type      = "pd-balanced"
+high_availability = true
+# agent_binary_path = "../../../../agent/elasticsearch-agent/dist/byoc-agent-linux-amd64"

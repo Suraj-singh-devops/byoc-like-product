@@ -1,0 +1,78 @@
+{{- /* Redis inside the cluster (docs/adr/0012): queues and wake-ups only; PostgreSQL is the record. */ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dp.selector" "redis" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      serviceAccountName: redis
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "dp.podSecurity" 999 | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          command: ["sh", "-c", 'exec redis-server --appendonly yes --dir /data --requirepass "$(cat /var/run/secrets/byoc/redis-password)"']
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'redis-cli -a "$(cat /var/run/secrets/byoc/redis-password)" --no-auth-warning ping | grep -q PONG']
+            periodSeconds: 5
+          securityContext:
+            {{- include "dp.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources.redis | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: platform-secrets, mountPath: /var/run/secrets/byoc, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: platform-secrets
+        {{- if eq .Values.secrets.source "secretManager" }}
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: byoc-redis
+        {{- else }}
+          secret:
+            secretName: {{ .Values.secrets.kubernetesSecret }}
+            defaultMode: 0440
+            items:
+              - {key: redis-password, path: redis-password}
+        {{- end }}
+        - {name: tmp, emptyDir: {}}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.redis.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dp.selector" "redis" | nindent 4 }}
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}

@@ -1,0 +1,37 @@
+# DEVELOPMENT ONLY: real GCP with your own gcloud application default credentials
+# (docs/adr/0015). Creates real, billable resources, and only in DEV_ALLOWED_PROJECTS.
+#
+#   gcloud auth application-default login
+#   gcloud auth application-default set-quota-project <sandbox-project>
+#   docker compose -f docker-compose.yml -f docker-compose.real-gcp.yml up --build -d
+#
+# Back to mock mode: docker compose up -d (without this file).
+#
+# Only the terraform-runner and the monitoring-worker receive the credentials (docs/adr/0004);
+# the API and the cluster-manager run without them.
+
+x-real-gcp-env: &real-gcp-env
+  MOCK_MODE: "false"
+  ENVIRONMENT: development
+  DEV_LOCAL_CREDENTIALS: "true"
+  DEV_ALLOWED_PROJECTS: ${DEV_ALLOWED_PROJECTS:-purpllesandboxtier}
+
+x-credentials: &credentials
+  GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcloud/application_default_credentials.json
+
+x-credentials-volume: &credentials-volume
+  - ${HOME}/.config/gcloud/application_default_credentials.json:/secrets/gcloud/application_default_credentials.json:ro
+
+services:
+  backend:
+    environment: *real-gcp-env
+  cluster-manager:
+    environment: *real-gcp-env
+  terraform-runner:
+    environment:
+      <<: [*real-gcp-env, *credentials]
+    volumes: *credentials-volume
+  monitoring-worker:
+    environment:
+      <<: [*real-gcp-env, *credentials]
+    volumes: *credentials-volume

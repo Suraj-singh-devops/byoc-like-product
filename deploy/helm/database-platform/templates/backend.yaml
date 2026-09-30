@@ -1,0 +1,111 @@
+{{- $workloads := list
+  (dict "name" "api" "replicas" .Values.replicas.api "resources" .Values.resources.api)
+  (dict "name" "cluster-manager" "replicas" .Values.replicas.clusterManager "resources" .Values.resources.clusterManager)
+  (dict "name" "terraform-runner" "replicas" .Values.replicas.terraformRunner "resources" .Values.resources.terraformRunner)
+  (dict "name" "monitoring-worker" "replicas" .Values.replicas.monitoringWorker "resources" .Values.resources.monitoringWorker)
+}}
+{{- range $w := $workloads }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $w.name }}
+  labels:
+    {{- include "dp.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $w.name }}
+spec:
+  replicas: {{ $w.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dp.selector" $w.name | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dp.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $w.name }}
+        byoc.io/backend: "true"
+      annotations:
+        checksum/settings: {{ toYaml $.Values.settings | sha256sum | trunc 16 }}
+    spec:
+      serviceAccountName: {{ $w.name }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "dp.podSecurity" 10001 | nindent 8 }}
+      {{- include "dp.sqlProxy" $ | nindent 6 }}
+      containers:
+        - name: {{ $w.name }}
+          image: {{ include "dp.backendImage" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: [{{ $w.name | quote }}]
+          env:
+            {{- include "dp.backendEnv" (dict "root" $ "role" $w.name "ksa" $w.name) | nindent 12 }}
+          {{- if eq $w.name "api" }}
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          {{- else }}
+          ports:
+            - {name: metrics, containerPort: 9101}
+          livenessProbe:
+            tcpSocket: {port: metrics}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          {{- end }}
+          securityContext:
+            {{- include "dp.containerSecurity" $ | nindent 12 }}
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "dp.secretMounts" $ | nindent 12 }}
+            {{- if eq $w.name "terraform-runner" }}
+            - name: workspaces
+              mountPath: /var/lib/byoc
+            {{- end }}
+      volumes:
+        {{- include "dp.secretVolumes" $ | nindent 8 }}
+        {{- if eq $w.name "terraform-runner" }}
+        - name: workspaces
+          emptyDir:
+            sizeLimit: 10Gi
+        {{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dp.selector" "api" | nindent 4 }}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dp.selector" "api" | nindent 6 }}
+---
+# The console proxies /api to "backend" when no load balancer routes it (same name as in Compose).
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dp.selector" "api" | nindent 4 }}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

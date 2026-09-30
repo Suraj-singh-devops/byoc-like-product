@@ -1,0 +1,59 @@
+[project]
+name = "byoc-control-plane"
+version = "0.1.0"
+description = "Control plane (API + workers) for the BYOC database infrastructure platform"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14",
+    "argon2-cffi>=23.1",
+    "cryptography>=43",
+    "fastapi>=0.115",
+    "google-auth>=2.35",
+    "prometheus-client>=0.21",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyjwt>=2.9",
+    "pyyaml>=6.0.2",
+    "redis>=5.2",
+    "requests>=2.32",
+    "sqlalchemy>=2.0.35",
+    "uvicorn[standard]>=0.30",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "fakeredis>=2.26",
+    "httpx2>=2.13.1",
+    "pytest>=8.3",
+    "responses>=0.25",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM"]
+ignore = [
+    "S101",  # assert is fine in tests and for invariants
+    "S311",  # random is used for simulated metrics only
+    "B008",  # FastAPI dependency defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+markers = [
+    "postgres: needs PostgreSQL (TEST_DATABASE_URL)",
+    "redis: needs Redis (TEST_REDIS_URL)",
+    "terraform: needs the terraform/tofu binary",
+]

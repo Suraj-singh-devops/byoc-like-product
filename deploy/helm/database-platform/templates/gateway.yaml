@@ -1,0 +1,96 @@
+{{- /* Google-managed external load balancer: /api to the API, everything else to the console. With a
+certificate map (Certificate Manager) it serves HTTPS and redirects HTTP. */ -}}
+{{- if .Values.ingress.enabled }}
+{{- $tls := ne .Values.gcp.certificateMap "" }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: console
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+  {{- if $tls }}
+  annotations:
+    networking.gke.io/certmap: {{ .Values.gcp.certificateMap }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ .Values.ingress.gatewayClassName }}
+  {{- with .Values.gcp.staticIpName }}
+  addresses:
+    - type: NamedAddress
+      value: {{ . }}
+  {{- end }}
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+    {{- if $tls }}
+    - name: https
+      protocol: HTTPS
+      port: 443
+    {{- end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: console
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: console
+      {{- if $tls }}
+      sectionName: https
+      {{- end }}
+  {{- with .Values.ingress.host }}
+  hostnames: [{{ . | quote }}]
+  {{- end }}
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /api}
+      backendRefs:
+        - {name: api, port: 8000}
+    - matches:
+        - path: {type: PathPrefix, value: /}
+      backendRefs:
+        - {name: frontend, port: 3000}
+{{- if $tls }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: console-redirect
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - {name: console, sectionName: http}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect: {scheme: https, statusCode: 301}
+{{- end }}
+{{- if .Values.gcp.projectId }}
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: api
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck: {requestPath: /readyz, port: 8000}
+  targetRef: {group: "", kind: Service, name: api}
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: frontend
+spec:
+  default:
+    config:
+      type: HTTP
+      httpHealthCheck: {requestPath: /login, port: 3000}
+  targetRef: {group: "", kind: Service, name: frontend}
+{{- end }}
+{{- end }}

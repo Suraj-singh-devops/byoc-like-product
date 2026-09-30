@@ -1,0 +1,136 @@
+# Optional local development environment. The target deployment is GKE (Helm chart, phase P3);
+# Compose exists for developer convenience only.
+#
+# Runs in MOCK_MODE: GCP, Terraform and the data plane are simulated and no cloud resources are
+# created. Real GCP mode (MOCK_MODE=false) is refused until customer access uses
+# per-organization identities (docs/adr/0003, implementation plan phase P4).
+#
+#   docker compose up --build        then open http://localhost:3000
+#
+# The defaults below are for local development only; the backend refuses to start with the
+# development SECRET_KEY when ENVIRONMENT=production.
+
+name: byoc
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: byoc-backend:local
+  restart: unless-stopped
+  environment: &backend-env
+    MOCK_MODE: ${MOCK_MODE:-true}
+    ENVIRONMENT: ${ENVIRONMENT:-development}
+    DATABASE_URL: postgresql+psycopg://byoc:${POSTGRES_PASSWORD:-byoc-local-dev}@postgres:5432/byoc
+    REDIS_URL: redis://redis:6379/0
+    SECRET_KEY: ${SECRET_KEY:-insecure-local-development-secret-change-me}
+    # Exact version from backend/app/providers/database/elasticsearch/versions.yaml; empty = catalog default.
+    ELASTICSEARCH_VERSION: ${ELASTICSEARCH_VERSION:-}
+    SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    DEMO_PASSWORD: ${DEMO_PASSWORD:-demo-password}
+    MOCK_SPEED: ${MOCK_SPEED:-1.0}
+    MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-15}
+    CONTROL_PLANE_PUBLIC_URL: ${CONTROL_PLANE_PUBLIC_URL:-}
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    LOG_FORMAT: ${LOG_FORMAT:-json}
+  volumes:
+    - workspaces:/var/lib/byoc
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: byoc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-byoc-local-dev}
+      POSTGRES_DB: byoc
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U byoc -d byoc"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  backend:
+    <<: *backend
+    command: ["api"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Privilege-separated backend processes (docs/adr/0004). Only the terraform-runner and the
+  # monitoring-worker build cloud providers; the API and the cluster-manager have no cloud access.
+  cluster-manager:
+    <<: *backend
+    command: ["cluster-manager"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: cluster-manager
+    depends_on: &worker-deps
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  terraform-runner:
+    <<: *backend
+    command: ["terraform-runner"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: terraform-runner
+    depends_on: *worker-deps
+
+  monitoring-worker:
+    <<: *backend
+    command: ["monitoring-worker"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: monitoring-worker
+    depends_on: *worker-deps
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:8000
+    image: byoc-frontend:local
+    restart: unless-stopped
+    ports:
+      - "${UI_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
+  workspaces:

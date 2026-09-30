@@ -1,0 +1,27 @@
+# Example of `terraform output -raw helm_values` (infrastructure/terraform/platform), for CI rendering.
+gcp:
+  projectId: byoc-platform-test
+  region: asia-south1
+  staticIpName: byoc-console
+  certificateMap: byoc-console
+  stateBucket: byoc-platform-test-byoc-tfstate
+  serviceAccounts:
+    api: byoc-api@byoc-platform-test.iam.gserviceaccount.com
+    cluster-manager: byoc-manager@byoc-platform-test.iam.gserviceaccount.com
+    terraform-runner: byoc-runner@byoc-platform-test.iam.gserviceaccount.com
+    monitoring-worker: byoc-monitor@byoc-platform-test.iam.gserviceaccount.com
+    migrate: byoc-migrator@byoc-platform-test.iam.gserviceaccount.com
+    redis: byoc-redis@byoc-platform-test.iam.gserviceaccount.com
+database:
+  mode: cloudsql
+  instanceConnectionName: byoc-platform-test:asia-south1:byoc-platform
+  users:
+    api: byoc-api@byoc-platform-test.iam
+    cluster-manager: byoc-manager@byoc-platform-test.iam
+    terraform-runner: byoc-runner@byoc-platform-test.iam
+    monitoring-worker: byoc-monitor@byoc-platform-test.iam
+    migrate: byoc-migrator@byoc-platform-test.iam
+secrets:
+  source: secretManager
+ingress:
+  host: byoc.example.com

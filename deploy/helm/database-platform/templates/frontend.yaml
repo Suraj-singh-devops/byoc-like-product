@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.replicas.frontend }}
+  selector:
+    matchLabels:
+      {{- include "dp.selector" "frontend" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: frontend
+    spec:
+      serviceAccountName: frontend
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "dp.podSecurity" 1000 | nindent 8 }}
+      containers:
+        - name: frontend
+          image: {{ .Values.image.frontend.repository }}:{{ .Values.image.frontend.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 3000}
+          readinessProbe:
+            httpGet: {path: /login, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /login, port: http}
+            periodSeconds: 15
+          securityContext:
+            {{- include "dp.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources.frontend | nindent 12 }}
+          volumeMounts:
+            - {name: cache, mountPath: /app/.next/cache}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: cache, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "dp.selector" "frontend" | nindent 4 }}
+  ports:
+    - {name: http, port: 3000, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dp.selector" "frontend" | nindent 6 }}

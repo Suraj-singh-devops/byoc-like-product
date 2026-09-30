@@ -1,0 +1,85 @@
+# BYOC control plane. `terraform output -raw helm_values` (infrastructure/terraform/platform)
+# fills gcp, database and secrets for GKE; the defaults suit any Kubernetes with a database URL.
+
+image:
+  backend:
+    repository: byoc-backend
+    tag: local
+  frontend:
+    repository: byoc-frontend
+    tag: local
+  pullPolicy: IfNotPresent
+
+settings:
+  mockMode: true            # real customer access is enabled in P4
+  environment: production
+  seedDemoData: false       # true only for acceptance environments
+  demoPassword: ""          # required when seedDemoData is true
+  elasticsearchVersion: ""
+  cookieSecure: true
+  logLevel: INFO
+
+# Google Cloud: empty values mean "not on GKE" (no Workload Identity annotations, no GKE resources).
+gcp:
+  projectId: ""
+  region: ""
+  staticIpName: ""
+  certificateMap: ""
+  stateBucket: ""
+  # Kubernetes ServiceAccount => Google service account (Workload Identity)
+  serviceAccounts: {}
+
+database:
+  mode: url                 # cloudsql | url
+  # url: a Kubernetes Secret holding the full DATABASE_URL (local clusters, tests)
+  urlSecret:
+    name: byoc-database
+    key: url
+  # cloudsql: Cloud SQL Auth Proxy sidecar, private IP, IAM login (no passwords)
+  instanceConnectionName: ""
+  name: byoc
+  users: {}                 # Kubernetes ServiceAccount => IAM database user
+  proxyImage: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2
+
+secrets:
+  source: kubernetes        # kubernetes | secretManager
+  # kubernetes: one Secret with the keys secret-key and redis-password
+  kubernetesSecret: byoc-platform
+  # secretManager: Secret Manager secret IDs (GKE Secret Manager add-on)
+  names:
+    secret-key: byoc-secret-key
+    redis-password: byoc-redis-password
+
+ingress:
+  enabled: true
+  host: ""
+  gatewayClassName: gke-l7-global-external-managed
+
+networkPolicy:
+  enabled: true
+  # Where client traffic to the console and the API comes from (Google load balancer and health checks).
+  ingressCidrs:
+    - 35.191.0.0/16
+    - 130.211.0.0/22
+  # Private Service Access range of Cloud SQL (cloudsql mode).
+  sqlCidr: 10.109.0.0/20
+
+replicas:
+  api: 2
+  frontend: 2
+  clusterManager: 1
+  terraformRunner: 1
+  monitoringWorker: 1
+
+resources:
+  api: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 1Gi}}
+  frontend: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
+  clusterManager: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 1Gi}}
+  terraformRunner: {requests: {cpu: 500m, memory: 1Gi}, limits: {memory: 2Gi}}
+  monitoringWorker: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 1Gi}}
+  redis: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
+  proxy: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
+
+redis:
+  image: redis:8.2-alpine
+  storage: 2Gi

@@ -1,0 +1,110 @@
+{{- /* Schema migrations before every install and upgrade. The migration job owns the schema; it
+then grants the other workloads' database users data access (app/infrastructure/db_grants.py).
+Its ServiceAccount and secrets are hooks too, because hooks run before the release's resources. */ -}}
+{{- $hook := dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-delete-policy" "before-hook-creation" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: migrate
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "-10"
+    {{- with index .Values.gcp.serviceAccounts "migrate" }}
+    iam.gke.io/gcp-service-account: {{ . }}
+    {{- end }}
+automountServiceAccountToken: false
+{{- if eq .Values.secrets.source "secretManager" }}
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: byoc-migrate
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "-10"
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/{{ .Values.gcp.projectId }}/secrets/{{ index .Values.secrets.names "secret-key" }}/versions/latest"
+        path: "secret-key"
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    {{- include "dp.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml (merge (dict "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded") $hook) | nindent 4 }}
+    helm.sh/hook-weight: "0"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "dp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+        byoc.io/backend: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: migrate
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "dp.podSecurity" 10001 | nindent 8 }}
+      {{- include "dp.sqlProxy" . | nindent 6 }}
+      containers:
+        - name: migrate
+          image: {{ include "dp.backendImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          env:
+            - {name: ENVIRONMENT, value: {{ .Values.settings.environment | quote }}}
+            - {name: MOCK_MODE, value: {{ .Values.settings.mockMode | quote }}}
+            - {name: SECRET_KEY_FILE, value: /var/run/secrets/byoc/secret-key}
+            {{- if eq .Values.database.mode "cloudsql" }}
+            - name: DATABASE_URL
+              value: {{ printf "postgresql+psycopg://%s@127.0.0.1:5432/%s" (index .Values.database.users "migrate" | required "database.users.migrate is required" | urlquery) .Values.database.name | quote }}
+            - name: DB_APP_ROLES
+              value: {{ without (values .Values.database.users | sortAlpha) (index .Values.database.users "migrate") | join "," | quote }}
+            {{- else }}
+            - {name: DATABASE_URL_FILE, value: /var/run/secrets/byoc-database/url}
+            {{- end }}
+          securityContext:
+            {{- include "dp.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - {name: secrets, mountPath: /var/run/secrets/byoc, readOnly: true}
+            {{- if ne .Values.database.mode "cloudsql" }}
+            - {name: database-url, mountPath: /var/run/secrets/byoc-database, readOnly: true}
+            {{- end }}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: secrets
+        {{- if eq .Values.secrets.source "secretManager" }}
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: byoc-migrate
+        {{- else }}
+          secret:
+            secretName: {{ .Values.secrets.kubernetesSecret }}
+            defaultMode: 0440
+            items:
+              - {key: secret-key, path: secret-key}
+        {{- end }}
+        {{- if ne .Values.database.mode "cloudsql" }}
+        - name: database-url
+          secret:
+            secretName: {{ .Values.database.urlSecret.name }}
+            defaultMode: 0440
+            items:
+              - {key: {{ .Values.database.urlSecret.key }}, path: url}
+        {{- end }}
+        - {name: tmp, emptyDir: {}}

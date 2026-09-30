@@ -1,0 +1,41 @@
+# Elasticsearch version catalog: the only versions the platform installs.
+#
+# Rules (docs/adr/0002-elasticsearch-distribution-and-licensing.md):
+# * Versions are exact (X.Y.Z). No "latest" and no minor-line wildcards.
+# * Adding or changing an entry is a deliberate, reviewed change. Test it in mock mode and on a
+#   real cluster before marking it "supported".
+# * status: supported  - offered for new clusters
+#           deprecated - existing clusters keep working and can be scaled; not offered for new ones
+#           withdrawn  - not installable; clusters on it cannot be scaled
+# * New clusters use ELASTICSEARCH_VERSION when set, otherwise default_version. Either must be
+#   a supported entry.
+# * license.review_status records the outcome of the legal review. It does not assert that any
+#   particular use is permitted.
+# * Checksums come from the Packages index of the signed APT repository below.
+
+engine: elasticsearch
+default_version: "9.5.4"
+
+versions:
+  - version: "9.5.4"
+    status: supported
+    distribution: elastic-default
+    package:
+      format: deb
+      apt_repository: "https://artifacts.elastic.co/packages/9.x/apt"
+      signing_key_url: "https://artifacts.elastic.co/GPG-KEY-elasticsearch"
+      signing_key_fingerprint: "46095ACC8548582C1A2699A9D27D666CD88E42B4"
+      artifacts:
+        amd64:
+          filename: "elasticsearch-9.5.4-amd64.deb"
+          sha256: "9530a71cabc0e47e895023f32eb0e587bedd9f03ff3d0f5ab05de0534c3b52a7"
+          size_bytes: 844982882
+        arm64:
+          filename: "elasticsearch-9.5.4-arm64.deb"
+          sha256: "155d265ec0b855998288b646069d451b822235caf38e5662e6a974450abef9eb"
+          size_bytes: 693938410
+    license:
+      declared_by_package: "Elastic-License"
+      review_status: pending
+      reference: "docs/adr/0002-elasticsearch-distribution-and-licensing.md"
+    notes: "Newest patch of the newest 9.x line when the catalog was created (APT release 2026-09-15)."

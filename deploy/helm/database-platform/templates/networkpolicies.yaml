@@ -1,0 +1,147 @@
+{{- /* Default deny in both directions, then only what each workload needs. The API and the
+cluster-manager reach Google APIs only for the Cloud SQL proxy; the console reaches nothing. */ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $cloudsql := eq .Values.database.mode "cloudsql" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: console-and-api-from-load-balancer
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [api, frontend]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range .Values.networkPolicy.ingressCidrs }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8000}
+        - {protocol: TCP, port: 3000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-console
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dp.selector" "api" | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "dp.selector" "frontend" | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: console-to-api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dp.selector" "frontend" | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "dp.selector" "api" | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-from-backend
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dp.selector" "redis" | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {byoc.io/backend: "true"}
+      ports:
+        - {protocol: TCP, port: 6379}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-egress
+spec:
+  podSelector:
+    matchLabels: {byoc.io/backend: "true"}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "dp.selector" "redis" | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 6379}
+    {{- if $cloudsql }}
+    - to:
+        - ipBlock: {cidr: {{ .Values.networkPolicy.sqlCidr }}}
+      ports:
+        - {protocol: TCP, port: 3307}
+    # GKE metadata server (Workload Identity tokens).
+    - to:
+        - ipBlock: {cidr: 169.254.169.254/32}
+        - ipBlock: {cidr: 169.254.169.252/32}
+      ports:
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 988}
+    # Google APIs (Cloud SQL Admin API for the proxy).
+    - ports:
+        - {protocol: TCP, port: 443}
+    {{- else }}
+    - ports:
+        - {protocol: TCP, port: 5432}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workers-reach-clouds
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [terraform-runner, monitoring-worker]}
+  policyTypes: [Egress]
+  egress:
+    # Customer clouds' APIs and Terraform registries.
+    - ports:
+        - {protocol: TCP, port: 443}
+    - to:
+        - ipBlock: {cidr: 169.254.169.254/32}
+        - ipBlock: {cidr: 169.254.169.252/32}
+      ports:
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 988}
+{{- end }}
