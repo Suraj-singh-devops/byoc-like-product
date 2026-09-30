@@ -11,15 +11,19 @@ variable "name_prefix" {
 }
 
 variable "nodes" {
+  description = "Node name => placement; machine_type and tags override the defaults per node (docs/adr/0016)."
   type = map(object({
-    zone    = string
-    ordinal = number
-    roles   = list(string)
+    zone         = string
+    ordinal      = number
+    roles        = list(string)
+    machine_type = optional(string)
+    tags         = optional(list(string), [])
   }))
 }
 
 variable "machine_type" {
-  type = string
+  description = "Machine type of nodes that do not set their own."
+  type        = string
 }
 
 variable "architecture" {
@@ -84,8 +88,8 @@ resource "google_compute_instance" "node" {
   project                   = var.project_id
   name                      = "${var.name_prefix}-${each.key}"
   zone                      = each.value.zone
-  machine_type              = var.machine_type
-  tags                      = var.network_tags
+  machine_type              = coalesce(each.value.machine_type, var.machine_type)
+  tags                      = concat(var.network_tags, each.value.tags)
   labels                    = merge(var.labels, { "byoc-node" = each.key })
   allow_stopping_for_update = true
   deletion_protection       = false
@@ -148,6 +152,8 @@ output "nodes" {
     for name, vm in google_compute_instance.node : name => {
       instance_name = vm.name
       instance_id   = vm.instance_id
+      self_link     = vm.self_link
+      machine_type  = vm.machine_type
       zone          = vm.zone
       private_ip    = vm.network_interface[0].network_ip
       hostname      = "${vm.name}.${vm.zone}.c.${var.project_id}.internal"
@@ -161,4 +167,15 @@ output "image" {
 
 output "has_public_ip" {
   value = anytrue([for vm in google_compute_instance.node : length(vm.network_interface[0].access_config) > 0])
+}
+
+output "instances" {
+  description = "Node name => machine type, tags and metadata as planned (for tests and troubleshooting)."
+  value = {
+    for name, vm in google_compute_instance.node : name => {
+      machine_type = vm.machine_type
+      tags         = vm.tags
+      metadata     = vm.metadata
+    }
+  }
 }

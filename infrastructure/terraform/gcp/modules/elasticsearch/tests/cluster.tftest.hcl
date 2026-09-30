@@ -215,3 +215,175 @@ run "rejects_unverifiable_package" {
 
   expect_failures = [var.es_package]
 }
+
+run "dedicated_ha_layout" {
+  command = plan
+
+  variables {
+    layout = "dedicated"
+    nodes = {
+      "master-1" = { zone = "asia-south1-a", ordinal = 1, roles = ["master"], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+      "master-2" = { zone = "asia-south1-b", ordinal = 2, roles = ["master"], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+      "master-3" = { zone = "asia-south1-c", ordinal = 3, roles = ["master"], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+      "data-1"   = { zone = "asia-south1-a", ordinal = 4, roles = ["data", "ingest"], machine_type = "e2-standard-8", data_disk_size_gb = 500 }
+      "data-2"   = { zone = "asia-south1-b", ordinal = 5, roles = ["data", "ingest"], machine_type = "e2-standard-8", data_disk_size_gb = 500 }
+      "data-3"   = { zone = "asia-south1-c", ordinal = 6, roles = ["data", "ingest"], machine_type = "e2-standard-8", data_disk_size_gb = 500, config_generation = 2 }
+      "coord-1"  = { zone = "asia-south1-a", ordinal = 7, roles = [], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+      "coord-2"  = { zone = "asia-south1-b", ordinal = 8, roles = [], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+    }
+    seed_nodes             = ["master-1", "master-2", "master-3"]
+    initial_master_nodes   = ["master-1", "master-2", "master-3"]
+    forced_awareness_zones = ["asia-south1-a", "asia-south1-b", "asia-south1-c"]
+    load_balancer_nodes    = ["coord-1", "coord-2"]
+    cluster_settings       = { "search.max_buckets" = "20000" }
+    cluster_settings_hash  = "971a936de98cf3f8"
+    node_settings          = { "thread_pool.write.queue_size" = "20000" }
+    heap_percent           = 40
+  }
+
+  assert {
+    condition     = length(module.compute.nodes) == 8
+    error_message = "Expected 3 masters, 3 data and 2 coordinating VMs."
+  }
+
+  assert {
+    condition     = module.compute.has_public_ip == false
+    error_message = "Database VMs must not get public IP addresses."
+  }
+
+  assert {
+    condition     = google_compute_forwarding_rule.endpoint[0].load_balancing_scheme == "INTERNAL" && google_compute_forwarding_rule.endpoint[0].ports == toset(["9200"])
+    error_message = "The endpoint must be an internal load balancer on 9200 only."
+  }
+
+  assert {
+    condition     = google_compute_address.endpoint[0].address_type == "INTERNAL"
+    error_message = "The endpoint address must be private."
+  }
+
+  assert {
+    condition     = length(google_compute_instance_group.endpoint) == 2
+    error_message = "One instance group per zone of the coordinating nodes."
+  }
+
+  assert {
+    condition     = google_compute_firewall.endpoint_health_checks[0].source_ranges == toset(["35.191.0.0/16", "130.211.0.0/22"]) && google_compute_firewall.endpoint_health_checks[0].target_tags == toset(["${local.lb_tag}"])
+    error_message = "Only Google's health checkers may probe, and only the load-balanced nodes."
+  }
+
+  assert {
+    condition     = module.storage.disks["data-1"].name == "production-search-3f9a-data-1-data"
+    error_message = "Every node keeps its own data disk."
+  }
+}
+
+run "dedicated_ha_node_details" {
+  command = plan
+
+  variables {
+    layout = "dedicated"
+    nodes = {
+      "master-1" = { zone = "asia-south1-a", ordinal = 1, roles = ["master"], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+      "data-1"   = { zone = "asia-south1-a", ordinal = 2, roles = ["data"], machine_type = "e2-standard-8", data_disk_size_gb = 500, config_generation = 3 }
+      "coord-1"  = { zone = "asia-south1-a", ordinal = 3, roles = [], machine_type = "e2-standard-4", data_disk_size_gb = 20 }
+    }
+    seed_nodes           = ["master-1"]
+    initial_master_nodes = ["master-1"]
+    load_balancer_nodes  = ["coord-1"]
+    node_settings        = { "http.max_content_length" = "200mb" }
+    heap_percent         = 40
+  }
+
+  assert {
+    condition     = module.compute.instances["data-1"].machine_type == "e2-standard-8" && module.compute.instances["master-1"].machine_type == "e2-standard-4"
+    error_message = "Every group gets its own machine type."
+  }
+
+  assert {
+    condition     = module.storage.sizes["data-1"] == 500 && module.storage.sizes["coord-1"] == 20
+    error_message = "Every group gets its own disk size."
+  }
+
+  assert {
+    condition     = module.compute.instances["data-1"].metadata["byoc-config-generation"] == "3" && module.compute.instances["coord-1"].metadata["byoc-node-roles"] == "none"
+    error_message = "Per-node config generation and empty roles for coordinating nodes."
+  }
+
+  assert {
+    condition     = jsondecode(module.compute.instances["data-1"].metadata["byoc-es-node-settings"])["http.max_content_length"] == "200mb" && module.compute.instances["data-1"].metadata["byoc-es-heap-percent"] == "40"
+    error_message = "Static settings and heap share travel in metadata."
+  }
+
+  assert {
+    condition     = contains(module.compute.instances["coord-1"].tags, "${local.lb_tag}") && !contains(module.compute.instances["data-1"].tags, "${local.lb_tag}")
+    error_message = "Only load-balanced nodes carry the health-check tag."
+  }
+}
+
+run "rejects_platform_managed_settings" {
+  command = plan
+
+  variables {
+    node_settings = { "xpack.security.enabled" = "false" }
+  }
+
+  expect_failures = [var.node_settings]
+}
+
+run "rejects_unsafe_setting_values" {
+  command = plan
+
+  variables {
+    node_settings = { "http.max_content_length" = "1mb\nnetwork.host: 0.0.0.0" }
+  }
+
+  expect_failures = [var.node_settings]
+}
+
+run "custom_elasticsearch_yml_settings" {
+  command = plan
+
+  variables {
+    node_settings = {
+      "indices.query.bool.max_clause_count" = "8192"
+      "xpack.ml.enabled"                    = "false"
+      "reindex.remote.whitelist"            = "10.0.0.5:9200,10.0.0.6:9200"
+      "http.max_content_length"             = "200mb"
+    }
+  }
+
+  assert {
+    condition     = jsondecode(module.compute.instances["node-1"].metadata["byoc-es-node-settings"])["xpack.ml.enabled"] == "false"
+    error_message = "Custom elasticsearch.yml settings travel in metadata."
+  }
+}
+
+run "rejects_network_settings" {
+  command = plan
+
+  variables {
+    node_settings = { "network.bind_host" = "0.0.0.0" }
+  }
+
+  expect_failures = [var.node_settings]
+}
+
+run "rejects_discovery_and_paths" {
+  command = plan
+
+  variables {
+    node_settings = { "path.repo" = "/mnt", "discovery.type" = "single-node" }
+  }
+
+  expect_failures = [var.node_settings]
+}
+
+run "rejects_invalid_setting_names" {
+  command = plan
+
+  variables {
+    node_settings = { "Bad Key" = "1" }
+  }
+
+  expect_failures = [var.node_settings]
+}

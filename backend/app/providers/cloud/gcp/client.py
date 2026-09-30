@@ -4,6 +4,7 @@ outside Terraform: validation, catalog lookups, instance status and guest attrib
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import requests
@@ -14,6 +15,7 @@ from google.auth.transport.requests import AuthorizedSession, Request
 
 from app.domain.enums import CloudAuthType
 from app.domain.errors import CloudProviderError
+from app.infrastructure.logging import get_logger
 from app.infrastructure.metrics import CLOUD_API_FAILURES
 from app.providers.cloud.base import CloudAccountContext, MachineType, Region
 from app.providers.cloud.gcp.catalog import architecture_for
@@ -70,7 +72,18 @@ def build_credentials(account: CloudAccountContext) -> Credentials:
     )
 
 
+log = get_logger(__name__)
+
+# Every call of this client only reads (testIamPermissions is a POST that changes nothing), so a
+# network error or a transient Google error is retried: a DNS or Wi-Fi blip on the control plane
+# must not fail a cluster operation. Resources are only changed by Terraform.
+RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
 class GcpApiClient:
+    sleep = staticmethod(time.sleep)
+
     def __init__(
         self, account: CloudAccountContext, timeout: float = 30.0, allowed_projects: frozenset[str] | None = None
     ) -> None:
@@ -94,12 +107,17 @@ class GcpApiClient:
         return getattr(self._credentials, "service_account_email", None) or self.account.service_account_email
 
     def ensure_token(self) -> None:
-        try:
-            self._credentials.refresh(Request())
-        except RefreshError as exc:
-            raise authentication_failed(_refresh_error_reason(exc)) from exc
-        except TransportError as exc:
-            raise self._unreachable("token", exc) from exc
+        for attempt, delay in enumerate((*RETRY_DELAYS, None)):
+            try:
+                self._credentials.refresh(Request())
+                return
+            except RefreshError as exc:
+                raise authentication_failed(_refresh_error_reason(exc)) from exc
+            except TransportError as exc:
+                if delay is None:
+                    raise self._unreachable("token", exc) from exc
+                log.warning("gcp_token_retry", attempt=attempt + 1, error=str(exc)[:200])
+                self.sleep(delay)
 
     def _unreachable(self, call: str, exc: Exception) -> CloudProviderError:
         CLOUD_API_FAILURES.labels("gcp", call).inc()
@@ -120,12 +138,22 @@ class GcpApiClient:
         json_body: dict[str, Any] | None = None,
         allow_404: bool = False,
     ) -> dict[str, Any] | None:
-        try:
-            resp = self._session.request(method, url, json=json_body, timeout=self.timeout)
-        except RefreshError as exc:
-            raise authentication_failed(_refresh_error_reason(exc)) from exc
-        except (requests.RequestException, TransportError) as exc:
-            raise self._unreachable(call, exc) from exc
+        for attempt, delay in enumerate((*RETRY_DELAYS, None)):
+            try:
+                resp = self._session.request(method, url, json=json_body, timeout=self.timeout)
+            except RefreshError as exc:
+                raise authentication_failed(_refresh_error_reason(exc)) from exc
+            except (requests.RequestException, TransportError) as exc:
+                if delay is None:
+                    raise self._unreachable(call, exc) from exc
+                log.warning("gcp_call_retry", call=call, attempt=attempt + 1, error=str(exc)[:200])
+                self.sleep(delay)
+                continue
+            if resp.status_code in RETRY_STATUS and delay is not None:
+                log.warning("gcp_call_retry", call=call, attempt=attempt + 1, status=resp.status_code)
+                self.sleep(delay)
+                continue
+            break
         if resp.status_code == 404 and allow_404:
             return None
         if resp.status_code >= 400:

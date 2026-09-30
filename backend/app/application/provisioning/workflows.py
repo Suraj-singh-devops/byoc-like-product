@@ -68,6 +68,7 @@ class Loaded:
     db: DatabaseProvider
     cloud: CloudDescriptor
     actual_state: dict[str, Any]
+    generation: int = 0
 
 
 def _bootstrap_rank(status: str | None) -> int:
@@ -115,6 +116,7 @@ class BaseWorkflow:
                 db=self.platform.registry.database(cluster.engine),
                 cloud=cloud,
                 actual_state=dict(cluster.actual_state or {}),
+                generation=cluster.generation,
             )
 
     @property
@@ -124,9 +126,24 @@ class BaseWorkflow:
         return 10.0
 
     def infra_request(
-        self, loaded: Loaded, nodes: list[NodePlacement], settings: dict[str, Any]
+        self,
+        loaded: Loaded,
+        nodes: list[NodePlacement],
+        settings: dict[str, Any],
+        generations: dict[str, int] | None = None,
     ) -> InfrastructureRequest:
+        """``generations``: config generation per node (docs/adr/0017); a node whose generation
+        changes re-renders its configuration and restarts. By default every node keeps the one it
+        has, and new nodes start at the cluster's current generation."""
         spec = loaded.spec
+        known = dict(loaded.actual_state.get("node_generations") or {})
+        current = int(loaded.actual_state.get("config_generation") or 0)
+        settings = {
+            **settings,
+            "node_generations": {
+                n.name: int((generations or {}).get(n.name, known.get(n.name, current))) for n in nodes
+            },
+        }
         return InfrastructureRequest(
             cluster_id=str(loaded.cluster_id),
             organization_id=str(loaded.organization_id),
@@ -149,6 +166,7 @@ class BaseWorkflow:
                 "byoc-engine": spec.engine,
             },
             network=spec.network,
+            load_balancer_nodes=loaded.db.load_balancer_targets(spec, nodes),
         )
 
     def zones(self, loaded: Loaded) -> list[str]:
@@ -171,8 +189,9 @@ class BaseWorkflow:
             on_poll=self.ctx.heartbeat,
         )
 
-    def preflight(self, loaded: Loaded) -> MachineType:
-        """In the terraform-runner, as the provisioning identity: access, the network, placement."""
+    def preflight(self, loaded: Loaded) -> tuple[MachineType, dict[str, MachineType]]:
+        """In the terraform-runner, as the provisioning identity: access, the network, placement
+        (the machine type of every node group, in a dedicated layout)."""
         spec = loaded.spec
         result = self.task(
             loaded,
@@ -181,11 +200,13 @@ class BaseWorkflow:
                 "region": spec.region,
                 "zone": spec.zone,
                 "machine_type": spec.machine_type,
+                "machine_types": sorted({g.machine_type for g in spec.node_groups}),
                 "network": spec.network.to_doc() if spec.network else None,
             },
             timeout=self.settings.preflight_timeout_seconds,
         )
-        return MachineType(**result["machine"])
+        machines = {name: MachineType(**m) for name, m in (result.get("machines") or {}).items()}
+        return MachineType(**result["machine"]), {g.name: machines[g.machine_type] for g in spec.node_groups}
 
     def terraform(self, loaded: Loaded, kind: str, request: InfrastructureRequest) -> dict[str, Any]:
         return self.task(
@@ -214,6 +235,65 @@ class BaseWorkflow:
             timeout=self.settings.refresh_timeout_seconds,
         )
 
+    def wait_for_settings(self, loaded: Loaded, expected: str) -> None:
+        deadline = time.monotonic() + self.settings.health_timeout_seconds
+        while True:
+            self.refresh(loaded)
+            with session_scope(self.sf) as s:
+                reports = [
+                    ((n.last_report or {}).get("config") or {}).get("cluster_settings_hash")
+                    for n in queries.active_nodes(s, loaded.cluster_id)
+                    if n.last_report
+                ]
+            if reports and all(h == expected for h in reports if h is not None) and expected in reports:
+                self.ctx.message("Live settings applied and reported by every node")
+                return
+            if time.monotonic() > deadline:
+                raise ProvisioningError(
+                    "The live settings were not applied in time.",
+                    code="CONFIG_NOT_APPLIED",
+                    reason="The agents did not report the new cluster settings.",
+                    suggested_action="Check the agents on the cluster page, then retry the operation.",
+                )
+            self.ctx.sleep(self.poll_interval)
+
+    def wait_for_node_config(self, loaded: Loaded, name: str, generation: int) -> None:
+        deadline = time.monotonic() + self.settings.bootstrap_timeout_seconds
+        while True:
+            self.refresh(loaded)
+            with session_scope(self.sf) as s:
+                node = next((n for n in queries.active_nodes(s, loaded.cluster_id) if n.name == name), None)
+                report = (node.last_report or {}) if node else {}
+            config = report.get("config") or {}
+            applied = config.get("generation")
+            if applied == generation and (report.get("engine") or {}).get("reachable"):
+                self.ctx.message(f"{name} restarted with the new configuration")
+                return
+            if config.get("rejected_generation") == generation:
+                reason = str(config.get("rejected_reason") or "Elasticsearch did not start.")
+                self.ctx.message(f"{name} did not start with the new configuration and was rolled back: {reason}")
+                raise ProvisioningError(
+                    f"{name} did not start with the new configuration.",
+                    code="CONFIG_REJECTED",
+                    reason=reason,
+                    suggested_action=(
+                        f"{name} was restored to its previous configuration and the remaining nodes were not "
+                        "changed. Correct or remove the setting on the Configuration page and apply again."
+                    ),
+                    details={"node": name},
+                )
+            if time.monotonic() > deadline:
+                raise ProvisioningError(
+                    f"{name} did not come back with the new configuration.",
+                    code="RESTART_TIMEOUT",
+                    reason=f"The node reports configuration generation {applied}, expected {generation}.",
+                    suggested_action=(
+                        "The remaining nodes were not restarted. Check the node, then retry: the rolling restart "
+                        "resumes where it stopped."
+                    ),
+                )
+            self.ctx.sleep(self.poll_interval)
+
     def merge_actual_state(self, **fields: Any) -> None:
         with session_scope(self.sf) as s:
             cluster = s.get(Cluster, self.ctx.cluster_id)
@@ -234,6 +314,8 @@ class BaseWorkflow:
                         ordinal=placement.ordinal,
                         zone=placement.zone,
                         role=",".join(placement.roles),
+                        node_group=placement.group,
+                        machine_type=placement.machine_type,
                         lifecycle_state=NodeLifecycle.BOOTSTRAPPING.value,
                         health=NodeHealth.UNKNOWN.value,
                         health_reasons=[],
@@ -365,7 +447,8 @@ class BaseWorkflow:
                             "name": n.name,
                             "zone": n.zone,
                             "privateIp": n.private_ip,
-                            "roles": n.role.split(","),
+                            "roles": n.role.split(",") if n.role else [],
+                            "group": n.node_group,
                             "instance": n.instance_name,
                         }
                         for n in nodes
@@ -403,8 +486,8 @@ class CreateClusterWorkflow(BaseWorkflow):
                 f"{spec.storage_type} per node, high availability {'on' if spec.high_availability else 'off'}"
             )
         with self.ctx.step("validate_cloud"):
-            machine = self.preflight(loaded)
-            db.validate(spec, machine)
+            machine, group_machines = self.preflight(loaded)
+            db.validate(spec, machine, group_machines)
             zones = self.zones(loaded)
             self.ctx.message(f"Access verified for {spec.project_id}; nodes will run in {', '.join(zones)}")
 
@@ -428,6 +511,11 @@ class CreateClusterWorkflow(BaseWorkflow):
             self.wait_for_bootstrap(loaded, names, BootstrapStatus.READY, "running")
         with self.ctx.step("health"):
             assessment = self.wait_for_health(loaded, len(names))
+            if spec.config:
+                # Static settings were rendered at boot; the agents push the live ones (docs/adr/0017).
+                if plan.settings.get("cluster_settings"):
+                    self.wait_for_settings(loaded, str(plan.settings["cluster_settings_hash"]))
+                self.merge_actual_state(config=dict(spec.config))
         with self.ctx.step("register"):
             status = assessment.engine_status or "unknown"
             detail = (
@@ -452,14 +540,16 @@ class ScaleClusterWorkflow(BaseWorkflow):
         loaded = self.load()
         spec, db = loaded.spec, loaded.db
         target = int(self.ctx.params["to"])
+        group = self.ctx.params.get("group")
         with session_scope(self.sf) as s:
-            current = placements_from_nodes(queries.active_nodes(s, loaded.cluster_id))
+            current = placements_from_nodes(queries.active_nodes(s, loaded.cluster_id), spec)
         zones = sorted({n.zone for n in current}) or [spec.zone]
         if spec.zones or spec.high_availability:
             zones = self.zones(loaded)
         previous_settings = loaded.actual_state.get("engine_settings")
-        if len(current) < target:
-            plan = db.scale(spec, current, target, zones, previous_settings)
+        present = sum(1 for n in current if n.group == group) if group else len(current)
+        if present < target:
+            plan = db.scale(spec, current, target, zones, previous_settings, group)
             nodes, added, settings = plan.nodes, plan.add, plan.settings
         else:
             nodes, added = current, []
@@ -496,7 +586,7 @@ class ScaleClusterWorkflow(BaseWorkflow):
         with self.ctx.step("configure"):
             self.wait_for_bootstrap(loaded, new_nodes, BootstrapStatus.READY, "running")
         with self.ctx.step("health"):
-            assessment = self.wait_for_health(loaded, target)
+            assessment = self.wait_for_health(loaded, spec.node_count)
             self.finalize_cluster(
                 assessment,
                 ClusterLifecycle.SCALING,
@@ -564,6 +654,95 @@ class DeleteClusterWorkflow(BaseWorkflow):
         return {"deleted": True}
 
 
+class UpdateConfigWorkflow(BaseWorkflow):
+    """Configuration change (docs/adr/0017). Terraform writes the new settings into the VMs'
+    metadata; the agents apply them: dynamic settings live on the elected master, static ones by
+    restarting one node at a time, each only once the cluster is healthy again. Safe to retry: nodes
+    already running this configuration are skipped."""
+
+    GROUP_ORDER = {"data": 0, "coordinating": 1, "master": 2}
+
+    def run(self) -> dict[str, Any]:
+        loaded = self.load()
+        spec, db = loaded.spec, loaded.db
+        dynamic = list(self.ctx.params.get("dynamic") or [])
+        static = list(self.ctx.params.get("static") or [])
+        generation = loaded.generation
+        steps = [
+            StepDef("validate", "Validate request and cloud access", S.VALIDATING),
+            StepDef("apply", "Write the configuration to the VMs (Terraform apply)", S.PROVISIONING),
+        ]
+        if dynamic:
+            steps.append(StepDef("dynamic", "Apply live settings", S.CONFIGURING))
+        if static:
+            steps.append(StepDef("restart", "Rolling restart, one node at a time", S.CONFIGURING))
+        steps.append(StepDef("health", "Validate cluster health", S.HEALTH_CHECK))
+        self.ctx.define_steps(steps)
+
+        with self.ctx.step("validate"):
+            self.preflight(loaded)
+            self.ctx.message(f"Live: {', '.join(dynamic) or 'none'}; with restart: {', '.join(static) or 'none'}")
+        with session_scope(self.sf) as s:
+            nodes = queries.active_nodes(s, loaded.cluster_id)
+            placements = placements_from_nodes(nodes, spec)
+            order = self.restart_order(nodes)
+        settings = db.configure(spec, placements, loaded.actual_state.get("engine_settings"))
+        with self.ctx.step("apply"):
+            request = self.infra_request(loaded, placements, settings)
+            self.plan(loaded, request)
+            self.apply(loaded, request)
+            self.merge_actual_state(engine_settings=settings)
+        if dynamic:
+            with self.ctx.step("dynamic"):
+                self.wait_for_settings(loaded, str(settings["cluster_settings_hash"]))
+        if static:
+            with self.ctx.step("restart"):
+                generations = dict(request.engine_settings["node_generations"])
+                for index, name in enumerate(order, start=1):
+                    # What the node reports it runs, not what its metadata asks for: a node that
+                    # rejected this generation has it in its metadata but runs the previous one.
+                    if self.running_generation(loaded, name) == generation:
+                        self.ctx.message(f"{name} already runs this configuration ({index}/{len(order)})")
+                        continue
+                    generations[name] = generation
+                    self.ctx.message(f"Restarting {name} ({index}/{len(order)})")
+                    self.terraform(loaded, "apply", self.infra_request(loaded, placements, settings, generations))
+                    self.merge_actual_state(node_generations=generations)
+                    self.wait_for_node_config(loaded, name, generation)
+                    self.wait_for_health(loaded, len(order))
+        with self.ctx.step("health"):
+            assessment = self.wait_for_health(loaded, len(order))
+            if static:
+                self.merge_actual_state(config_generation=generation)
+            self.merge_actual_state(config=dict(spec.config))
+            changed = ", ".join(dynamic + static)
+            self.finalize_cluster(
+                assessment,
+                ClusterLifecycle.UPDATING,
+                "CONFIG_UPDATED",
+                f"Configuration updated: {changed}" + (" (rolling restart)" if static else ""),
+            )
+        self.ctx.result.update({"dynamic": dynamic, "static": static, "restarted": order if static else []})
+        return self.ctx.result
+
+    def running_generation(self, loaded: Loaded, name: str) -> int | None:
+        with session_scope(self.sf) as s:
+            node = next((n for n in queries.active_nodes(s, loaded.cluster_id) if n.name == name), None)
+            generation = ((node.last_report or {}).get("config") or {}).get("generation") if node else None
+        return int(generation) if generation is not None else None
+
+    def restart_order(self, nodes: list[ClusterNode]) -> list[str]:
+        """Data, then coordinating, then master nodes; master-eligible nodes after the others in a
+        combined layout; the elected master last."""
+
+        def key(node: ClusterNode) -> tuple[int, int, int]:
+            group = self.GROUP_ORDER.get(node.node_group or "", 2 if "master" in node.role.split(",") else 0)
+            elected = bool(((node.last_report or {}).get("engine") or {}).get("is_master"))
+            return group, int(elected), node.ordinal
+
+        return [n.name for n in sorted(nodes, key=key)]
+
+
 class HealthCheckWorkflow(BaseWorkflow):
     def run(self) -> dict[str, Any]:
         loaded = self.load()
@@ -587,4 +766,5 @@ WORKFLOWS: dict[str, type[BaseWorkflow]] = {
     "SCALE_CLUSTER": ScaleClusterWorkflow,
     "DELETE_CLUSTER": DeleteClusterWorkflow,
     "HEALTH_CHECK": HealthCheckWorkflow,
+    "UPDATE_CONFIG": UpdateConfigWorkflow,
 }

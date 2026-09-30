@@ -44,6 +44,12 @@ FOUNDATION = (
     ("module.cluster.aws_s3_bucket.artifacts", "Creating private artifacts bucket"),
     ("module.cluster.aws_s3_object.agent[0]", "Uploading BYOC agent binary"),
 )
+LOAD_BALANCER = (
+    (
+        "module.cluster.aws_lb.endpoint[0]",
+        "Creating internal Network Load Balancer (port 9200) for the coordinating nodes",
+    ),
+)
 NODE_RESOURCES = (
     'module.cluster.aws_ebs_volume.data["{node}"]',
     'module.cluster.aws_instance.node["{node}"]',
@@ -169,7 +175,8 @@ class MockAwsProvider(SimulatedCloudProvider):
             "vpc": network.vpc if network else "?",
             "cidrs": ", ".join(network.cidrs) if network else "?",
         }
-        return tuple((address, message.format(**values)) for address, message in FOUNDATION)
+        lb = LOAD_BALANCER if request.load_balancer_nodes else ()
+        return tuple((address, message.format(**values)) for address, message in FOUNDATION + lb)
 
     def teardown_messages(self, request: InfrastructureRequest) -> tuple[str, ...]:
         return (
@@ -181,10 +188,11 @@ class MockAwsProvider(SimulatedCloudProvider):
     def node_messages(self, request: InfrastructureRequest, node: NodePlacement) -> tuple[str, str]:
         instance = request.instance_name(node.name)
         subnet = request.network.subnet_for(node.zone).id if request.network else "?"
+        size = node.storage_gb or request.storage_gb
+        machine = node.machine_type or request.machine_type
         return (
-            f"Creating EBS volume {instance}-data ({request.storage_gb} GB {request.storage_type}, encrypted) "
-            f"in {node.zone}",
-            f"Launching EC2 instance {instance} ({request.machine_type}, {subnet}, IMDSv2, no public IP)",
+            f"Creating EBS volume {instance}-data ({size} GB {request.storage_type}, encrypted) in {node.zone}",
+            f"Launching EC2 instance {instance} ({machine}, {subnet}, IMDSv2, no public IP)",
         )
 
     def instance_id(self, project_id: str, zone: str, instance_name: str) -> str:
@@ -207,4 +215,5 @@ class MockAwsProvider(SimulatedCloudProvider):
             },
             "artifacts_bucket": f"{prefix}-art-mock",
             "http_endpoints": [f"https://{n.private_ip}:9200" for n in nodes],
+            "endpoint": f"https://{lb}:9200" if (lb := self.load_balancer_ip(request)) else None,
         }

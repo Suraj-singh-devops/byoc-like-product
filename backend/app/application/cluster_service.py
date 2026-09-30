@@ -19,7 +19,7 @@ from app.application.platform import Platform
 from app.application.preconditions import require_available_network, require_connected_account
 from app.application.principal import Principal
 from app.application.provisioning.outcome import add_event, finalize_operation, request_cancellation
-from app.domain.cluster_spec import ClusterSpec, EnvironmentRef, validate_generic
+from app.domain.cluster_spec import COMBINED, DEDICATED, ClusterSpec, EnvironmentRef, NodeGroupSpec, validate_generic
 from app.domain.enums import EventSeverity, OperationType
 from app.domain.errors import Conflict, NotFound, ValidationFailed
 from app.domain.network import NetworkRef, plan_zones
@@ -55,6 +55,11 @@ class ClusterCreateInput:
     zone: str | None = None
     cloud_account_id: str | None = None
     region: str | None = None
+    # Dedicated layout (docs/adr/0016): group => {count, machine_type, storage_gb}.
+    layout: str = COMBINED
+    node_groups: dict[str, dict[str, Any]] | None = None
+    # Initial configuration overrides (docs/adr/0017).
+    config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -66,11 +71,45 @@ class ClusterView:
     created_by_email: str | None
 
 
-def placements_from_nodes(nodes: list[ClusterNode]) -> list[NodePlacement]:
+def placements_from_nodes(nodes: list[ClusterNode], spec: ClusterSpec | None = None) -> list[NodePlacement]:
+    def storage(group: str | None) -> int | None:
+        found = spec.group(group) if spec is not None and group else None
+        return found.storage_gb if found else None
+
     return [
-        NodePlacement(name=n.name, ordinal=n.ordinal, zone=n.zone, roles=tuple(r for r in n.role.split(",") if r))
+        NodePlacement(
+            name=n.name,
+            ordinal=n.ordinal,
+            zone=n.zone,
+            roles=tuple(r for r in n.role.split(",") if r),
+            group=n.node_group,
+            machine_type=n.machine_type,
+            storage_gb=storage(n.node_group),
+        )
         for n in sorted(nodes, key=lambda n: n.ordinal)
     ]
+
+
+def node_groups_from_input(groups: dict[str, dict[str, Any]] | None) -> tuple[NodeGroupSpec, ...]:
+    problems: dict[str, str] = {}
+    result = []
+    for name, group in (groups or {}).items():
+        try:
+            result.append(
+                NodeGroupSpec(
+                    name=name,
+                    count=int(group["count"]),
+                    machine_type=str(group["machine_type"]).strip(),
+                    storage_gb=int(group.get("storage_gb") or 20),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            problems[f"node_groups.{name}"] = "Give count and machine_type (and optionally storage_gb)."
+    if not result:
+        problems["node_groups"] = "A dedicated layout needs node groups."
+    if problems:
+        raise ValidationFailed("The node groups are invalid.", details={"fields": problems})
+    return tuple(result)
 
 
 class ClusterService:
@@ -192,6 +231,12 @@ class ClusterService:
         cloud = self.registry.descriptor(account.provider)
         ref = network_ref(network)
         zones = plan_zones((network.details or {}).get("zones") or [], data.zone, data.high_availability)
+        if data.layout not in (COMBINED, DEDICATED):
+            raise ValidationFailed(
+                f"Unknown layout {data.layout}.", details={"fields": {"layout": "Use combined or dedicated."}}
+            )
+        groups = node_groups_from_input(data.node_groups) if data.layout == DEDICATED else ()
+        data_group = next((g for g in groups if g.name == "data"), None)
         spec = ClusterSpec(
             name=data.name.strip(),
             engine=db.engine,
@@ -201,14 +246,17 @@ class ClusterService:
             project_id=account.project_id,
             region=network.region,
             zone=zones[0],
-            machine_type=data.machine_type.strip(),
-            node_count=data.node_count,
-            storage_gb=data.storage_gb,
+            machine_type=(data_group.machine_type if data_group else data.machine_type).strip(),
+            node_count=sum(g.count for g in groups) if groups else data.node_count,
+            storage_gb=data_group.storage_gb if data_group else data.storage_gb,
             storage_type=data.storage_type.strip(),
             high_availability=data.high_availability,
             environment=EnvironmentRef(id=str(environment.id), name=environment.name, type=environment.type),
             network=ref,
             zones=tuple(zones),
+            layout=data.layout,
+            node_groups=groups,
+            config=db.merge_config({}, data.config) if data.config else {},
         )
         validate_generic(spec)
         if spec.storage_type not in {s.name for s in cloud.storage_types()}:
@@ -217,8 +265,27 @@ class ClusterService:
                 details={"fields": {"storage_type": "Unsupported storage type."}},
             )
         # Static check here; the terraform-runner verifies placement in the account (preflight).
-        machine = cloud.validate_placement(spec.region, spec.zone, spec.machine_type)
-        db.validate(spec, machine)
+        machine = cloud.validate_placement(spec.region, spec.zone, spec.machine_type, zones)
+        group_machines = {}
+        for group in spec.node_groups:
+            try:
+                group_machines[group.name] = cloud.validate_placement(spec.region, spec.zone, group.machine_type, zones)
+            except ValidationFailed as exc:
+                raise ValidationFailed(
+                    exc.message, details={"fields": {f"node_groups.{group.name}.machine_type": exc.message}}
+                ) from exc
+        if len({m.architecture for m in group_machines.values()}) > 1:
+            raise ValidationFailed(
+                "All node groups must use the same CPU architecture.",
+                reason="Every node installs the same Elasticsearch package and VM image.",
+                details={
+                    "fields": {
+                        f"node_groups.{name}.machine_type": f"{m.name} is {m.architecture}."
+                        for name, m in group_machines.items()
+                    }
+                },
+            )
+        db.validate(spec, machine, group_machines)
         self._check_capacity(network, ref, zones, spec.node_count)
         if queries.cluster_name_taken(self.session, org, spec.name):
             raise Conflict(
@@ -354,16 +421,23 @@ class ClusterService:
                 details={"operation_id": str(active.id)},
             )
 
-    def scale(self, cluster_id: str, node_count: int, idempotency_key: str | None) -> tuple[Cluster, Operation]:
+    def scale(
+        self, cluster_id: str, node_count: int, idempotency_key: str | None, group: str | None = None
+    ) -> tuple[Cluster, Operation]:
         self.principal.require(Permission.CLUSTER_SCALE)
         cluster = self._cluster(cluster_id, for_update=True)
-        request_hash = request_fingerprint({"operation": "scale", "cluster": str(cluster.id), "node_count": node_count})
+        request_hash = request_fingerprint(
+            {"operation": "scale", "cluster": str(cluster.id), "node_count": node_count, "group": group}
+        )
         existing = find_idempotent_operation(
             self.session, cluster.organization_id, idempotency_key, OperationType.SCALE_CLUSTER, request_hash
         )
         if existing is not None:
             return cluster, existing
         nodes = queries.active_nodes(self.session, cluster.id)
+        spec = ClusterSpec.from_desired_state(cluster.desired_state)
+        if spec.layout == DEDICATED:
+            return self._scale_group(cluster, spec, nodes, group, node_count, idempotency_key, request_hash)
         if node_count < len(nodes):
             raise ValidationFailed(
                 f"Scaling down ({len(nodes)} to {node_count} nodes) is not supported.",
@@ -380,7 +454,6 @@ class ClusterService:
         require_connected_account(self.session, cluster)
         require_available_network(self.session, cluster)
         self._ensure_idle(cluster)
-        spec = ClusterSpec.from_desired_state(cluster.desired_state)
         db = self.registry.database(cluster.engine)
         plan = db.scale(
             spec,
@@ -411,6 +484,152 @@ class ClusterService:
             "SCALE_REQUESTED",
             EventSeverity.INFO,
             f"Scale from {plan.current_count} to {plural(node_count, 'node')} requested by {self.principal.email}",
+        )
+        self.session.commit()
+        self.platform.queue.enqueue(str(op.id))
+        return cluster, op
+
+    def _scale_group(
+        self,
+        cluster: Cluster,
+        spec: ClusterSpec,
+        nodes: list[ClusterNode],
+        group: str | None,
+        node_count: int,
+        idempotency_key: str | None,
+        request_hash: str,
+    ) -> tuple[Cluster, Operation]:
+        """Dedicated layout (docs/adr/0016): data and coordinating groups grow; masters stay at 3."""
+        db = self.registry.database(cluster.engine)
+        placements = placements_from_nodes(nodes, spec)
+        zones = list(spec.zones) or sorted({n.zone for n in nodes}) or [cluster.zone]
+        previous = (cluster.actual_state or {}).get("engine_settings")
+        # Validates the group and refuses scale-down before looking at the lifecycle.
+        plan = db.scale(spec, placements, node_count, zones, previous, group)
+        if cluster.lifecycle_state != ClusterLifecycle.ACTIVE:
+            raise Conflict(
+                f"The cluster is {cluster.lifecycle_state}; only an active cluster can be scaled.",
+                suggested_action="Wait for the current operation to finish, or retry the failed one.",
+            )
+        require_connected_account(self.session, cluster)
+        require_available_network(self.session, cluster)
+        self._ensure_idle(cluster)
+        target = spec.with_group_count(str(group), node_count)
+        self._check_capacity_for(cluster, target.node_count - spec.node_count)
+        assert_cluster_transition(ClusterLifecycle(cluster.lifecycle_state), ClusterLifecycle.SCALING)
+        cluster.generation += 1
+        cluster.node_count = target.node_count
+        cluster.desired_state = target.to_desired_state(cluster.generation)
+        cluster.lifecycle_state = ClusterLifecycle.SCALING.value
+        cluster.status_message = None
+        op = new_operation(
+            self.session,
+            principal=self.principal,
+            cluster=cluster,
+            operation_type=OperationType.SCALE_CLUSTER,
+            params={"from": plan.current_count, "to": plan.target_count, "group": group},
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        audit_started(self.session, self.principal, cluster, op)
+        add_event(
+            self.session,
+            cluster,
+            "SCALE_REQUESTED",
+            EventSeverity.INFO,
+            f"Scale of the {group} group from {plan.current_count} to {plural(node_count, 'node')} "
+            f"requested by {self.principal.email}",
+        )
+        self.session.commit()
+        self.platform.queue.enqueue(str(op.id))
+        return cluster, op
+
+    def _check_capacity_for(self, cluster: Cluster, added: int) -> None:
+        if cluster.network_id is None or added <= 0:
+            return
+        network = self.session.get(Network, cluster.network_id)
+        free = sum(
+            int(s.get("available_ips") or 0) for s in ((network.details or {}).get("subnets", []) if network else [])
+        )
+        if free and added > free:
+            raise ValidationFailed(
+                f"The network's subnets have {plural(free, 'free address', 'es')} for {plural(added, 'new node')}.",
+                details={"fields": {"node_count": f"At most {free} more in this network."}},
+            )
+
+    # -------------------------------------------------------------- configuration
+
+    def config(self, cluster_id: str) -> dict[str, Any]:
+        cluster = self._cluster(cluster_id, include_deleted=True)
+        db = self.registry.database(cluster.engine)
+        spec = ClusterSpec.from_desired_state(cluster.desired_state)
+        desired = spec.config
+        catalog_keys = {s["key"] for s in db.settings_catalog()}
+        applied = dict((cluster.actual_state or {}).get("config") or {})
+        return {
+            "cluster_id": str(cluster.id),
+            "settings": db.settings_catalog(),
+            "desired": desired,
+            "applied": applied,
+            "pending": db.config_plan(applied, desired),
+            # The rendered configuration file with the desired settings (docs/adr/0018).
+            "config_file": db.config_file(spec, desired),
+            "custom": {k: v for k, v in desired.items() if k not in catalog_keys},
+        }
+
+    def update_config(
+        self, cluster_id: str, changes: dict[str, Any], idempotency_key: str | None
+    ) -> tuple[Cluster, Operation]:
+        """Apply configuration changes (docs/adr/0017): dynamic ones live, static ones by a rolling restart."""
+        self.principal.require(Permission.CLUSTER_CONFIGURE)
+        cluster = self._cluster(cluster_id, for_update=True)
+        request_hash = request_fingerprint({"operation": "config", "cluster": str(cluster.id), "changes": changes})
+        existing = find_idempotent_operation(
+            self.session, cluster.organization_id, idempotency_key, OperationType.UPDATE_CONFIG, request_hash
+        )
+        if existing is not None:
+            return cluster, existing
+        db = self.registry.database(cluster.engine)
+        spec = ClusterSpec.from_desired_state(cluster.desired_state)
+        merged = db.merge_config(spec.config, changes)
+        plan = db.config_plan(spec.config, merged)
+        if not plan["dynamic"] and not plan["static"]:
+            raise ValidationFailed(
+                "The configuration already has these values.",
+                code="NO_CHANGE",
+                details={"fields": {k: "Unchanged." for k in changes}},
+            )
+        if cluster.lifecycle_state != ClusterLifecycle.ACTIVE:
+            raise Conflict(
+                f"The cluster is {cluster.lifecycle_state}; configuration changes need an active cluster.",
+                suggested_action="Wait for the current operation to finish, or retry the failed one.",
+            )
+        require_connected_account(self.session, cluster)
+        require_available_network(self.session, cluster)
+        self._ensure_idle(cluster)
+        assert_cluster_transition(ClusterLifecycle(cluster.lifecycle_state), ClusterLifecycle.UPDATING)
+        cluster.generation += 1
+        cluster.desired_state = spec.with_config(merged).to_desired_state(cluster.generation)
+        cluster.lifecycle_state = ClusterLifecycle.UPDATING.value
+        cluster.status_message = None
+        op = new_operation(
+            self.session,
+            principal=self.principal,
+            cluster=cluster,
+            operation_type=OperationType.UPDATE_CONFIG,
+            params={"changes": changes, "dynamic": plan["dynamic"], "static": plan["static"]},
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        audit_started(self.session, self.principal, cluster, op)
+        restart = " (rolling restart)" if plan["static"] else ""
+        add_event(
+            self.session,
+            cluster,
+            "CONFIG_UPDATE_REQUESTED",
+            EventSeverity.INFO,
+            f"Configuration change of {', '.join(plan['dynamic'] + plan['static'])}{restart} requested by "
+            f"{self.principal.email}",
         )
         self.session.commit()
         self.platform.queue.enqueue(str(op.id))

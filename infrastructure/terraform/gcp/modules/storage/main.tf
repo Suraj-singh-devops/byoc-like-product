@@ -11,12 +11,13 @@ variable "name_prefix" {
 }
 
 variable "nodes" {
-  description = "Node name => zone."
-  type        = map(object({ zone = string }))
+  description = "Node name => zone, and optionally the node's own disk size (docs/adr/0016)."
+  type        = map(object({ zone = string, size_gb = optional(number) }))
 }
 
 variable "size_gb" {
-  type = number
+  description = "Disk size of nodes that do not set their own."
+  type        = number
 }
 
 variable "type" {
@@ -46,7 +47,7 @@ resource "google_compute_disk" "data" {
   name     = "${var.name_prefix}-${each.key}-data"
   zone     = each.value.zone
   type     = var.type
-  size     = var.size_gb
+  size     = coalesce(each.value.size_gb, var.size_gb)
   labels   = merge(var.labels, { "byoc-node" = each.key, "byoc-disk" = "data" })
 
   dynamic "disk_encryption_key" {
@@ -59,4 +60,8 @@ resource "google_compute_disk" "data" {
 
 output "disks" {
   value = { for name, disk in google_compute_disk.data : name => { self_link = disk.self_link, name = disk.name } }
+}
+
+output "sizes" {
+  value = { for name, disk in google_compute_disk.data : name => disk.size }
 }

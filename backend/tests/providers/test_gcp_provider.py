@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from app.config.settings import Settings
-from app.domain.errors import CloudProviderError, ProvisioningError, ValidationFailed
+from app.domain.errors import CloudProviderError, PlatformError, ProvisioningError, ValidationFailed
 from app.domain.network import NetworkRef, SubnetRef
 from app.providers.cloud.base import (
     CloudAccountContext,
@@ -17,6 +17,7 @@ from app.providers.cloud.base import (
     NodePlacement,
     Region,
 )
+from app.providers.cloud.gcp.descriptor import GcpDescriptor
 from app.providers.cloud.gcp.errors import from_google_response, from_terraform_diagnostics
 from app.providers.cloud.gcp.permissions import REQUIRED_PERMISSIONS, role_for_permission
 from app.providers.cloud.gcp.provider import GCPProvider, guard_plan, parse_outputs, resource_type, summarize_plan
@@ -207,6 +208,54 @@ class TestTerraformRendering:
         assert root["terraform"]["backend"] == {"local": {"path": "terraform.tfstate"}}
         assert root["output"]["nodes"]["value"] == "${module.cluster.nodes}"
         assert root["provider"]["google"]["project"] == "customer-prod"
+
+    def test_dedicated_layout_and_configuration(self) -> None:
+        req = request(
+            nodes=[
+                NodePlacement("master-1", 1, "asia-south1-a", ("master",), "master", "e2-standard-4", 20),
+                NodePlacement("data-1", 2, "asia-south1-b", ("data", "ingest"), "data", "e2-standard-8", 500),
+                NodePlacement("coord-1", 3, "asia-south1-c", (), "coordinating", "e2-standard-4", 20),
+            ],
+            load_balancer_nodes=["coord-1"],
+        )
+        req.engine_settings.update(
+            {
+                "layout": "dedicated",
+                "forced_awareness_zones": ["asia-south1-a", "asia-south1-b", "asia-south1-c"],
+                "cluster_settings": {"search.max_buckets": "20000"},
+                "cluster_settings_hash": "971a936de98cf3f8",
+                "node_settings": {"thread_pool.write.queue_size": "20000"},
+                "heap_percent": 40,
+                "node_generations": {"master-1": 0, "data-1": 2, "coord-1": 0},
+            }
+        )
+        variables = module_variables(req, agent=None, control_plane_url="", agent_audience="a")
+        assert variables["nodes"] == {
+            "master-1": {
+                "zone": "asia-south1-a", "ordinal": 1, "roles": ["master"],
+                "machine_type": "e2-standard-4", "data_disk_size_gb": 20,
+            },
+            "data-1": {
+                "zone": "asia-south1-b", "ordinal": 2, "roles": ["data", "ingest"],
+                "machine_type": "e2-standard-8", "data_disk_size_gb": 500, "config_generation": 2,
+            },
+            "coord-1": {
+                "zone": "asia-south1-c", "ordinal": 3, "roles": [],
+                "machine_type": "e2-standard-4", "data_disk_size_gb": 20,
+            },
+        }  # fmt: skip
+        assert variables["layout"] == "dedicated"
+        assert variables["load_balancer_nodes"] == ["coord-1"]
+        assert variables["cluster_settings"] == {"search.max_buckets": "20000"}
+        assert variables["node_settings"] == {"thread_pool.write.queue_size": "20000"}
+        assert variables["heap_percent"] == 40
+        root = render_root_module(req, variables, backend_config(req))
+        assert root["output"]["endpoint"]["value"] == "${module.cluster.endpoint}"
+
+    def test_combined_layout_defaults(self) -> None:
+        variables = module_variables(request(), agent=None, control_plane_url="", agent_audience="a")
+        assert variables["layout"] == "combined" and variables["load_balancer_nodes"] == []
+        assert variables["cluster_settings"] == {} and variables["heap_percent"] == 50
 
     def test_state_stays_local_until_the_platform_state_bucket_exists(self) -> None:
         # P5 moves state to the platform's bucket, one prefix per organization and cluster (ADR 0005).
@@ -494,3 +543,90 @@ class TestNetworkLookup:
         for permission in ("compute.networks.create", "compute.subnetworks.delete", "compute.routers.create"):
             assert permission not in REQUIRED_PERMISSIONS
         assert {"compute.firewalls.create", "compute.subnetworks.use"} <= set(REQUIRED_PERMISSIONS)
+
+
+class TestStaticPlacementCheck:
+    """The API's request-time check (no cloud access): a registered network's zones, looked up in
+    the customer's project, win over the static region list (regression: regions
+    missing from the list blocked real clusters)."""
+
+    def test_network_zones_are_authoritative(self, settings: Settings) -> None:
+        GCP_DESCRIPTOR = GcpDescriptor(settings, simulated=False)  # noqa: N806
+
+        zones = ["me-central2-a", "me-central2-b", "me-central2-c"]
+        machine = GCP_DESCRIPTOR.validate_placement("me-central2", "me-central2-a", "e2-standard-4", zones)
+        assert machine.name == "e2-standard-4"
+        with pytest.raises(ValidationFailed) as excinfo:
+            GCP_DESCRIPTOR.validate_placement("me-central2", "me-central2-x", "e2-standard-4", zones)
+        assert "zone" in excinfo.value.details["fields"]
+
+    def test_without_a_network_the_static_list_applies(self, settings: Settings) -> None:
+        GCP_DESCRIPTOR = GcpDescriptor(settings, simulated=False)  # noqa: N806
+
+        with pytest.raises(ValidationFailed):
+            GCP_DESCRIPTOR.validate_placement("me-central2", "me-central2-a", "e2-standard-4")
+        assert GCP_DESCRIPTOR.validate_placement("asia-east1", "asia-east1-a", "e2-standard-4").vcpus == 4
+
+
+class _Response:
+    def __init__(self, status: int, body: dict[str, Any] | None = None) -> None:
+        self.status_code = status
+        self._body = body or {}
+        self.content = b"{}"
+        self.text = "{}"
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+
+class _FlakySession:
+    """Fails the first ``failures`` calls with ``error`` (an exception or a status code)."""
+
+    def __init__(self, failures: int, error: Any) -> None:
+        self.failures, self.error, self.calls = failures, error, 0
+
+    def request(self, *args: Any, **kwargs: Any) -> _Response:
+        self.calls += 1
+        if self.calls <= self.failures:
+            if isinstance(self.error, int):
+                return _Response(self.error, {"error": {"message": "backend error"}})
+            raise self.error
+        return _Response(200, {"projectId": "p", "lifecycleState": "ACTIVE"})
+
+
+def _client(session: _FlakySession) -> Any:
+    from app.providers.cloud.gcp.client import GcpApiClient
+
+    client = GcpApiClient.__new__(GcpApiClient)
+    client.project, client.timeout, client._session = "p", 5.0, session
+    client.sleep = lambda _: None  # type: ignore[method-assign]
+    return client
+
+
+class TestTransientFailures:
+    """A DNS or network blip on the control plane must not fail a cluster operation."""
+
+    def test_dns_failure_is_retried(self) -> None:
+        import requests
+
+        session = _FlakySession(2, requests.ConnectionError("Failed to resolve 'cloudresourcemanager.googleapis.com'"))
+        assert _client(session).get_project()["projectId"] == "p"
+        assert session.calls == 3
+
+    def test_persistent_network_failure_is_reported(self) -> None:
+        import requests
+
+        session = _FlakySession(99, requests.ConnectionError("Failed to resolve 'compute.googleapis.com'"))
+        with pytest.raises(CloudProviderError) as excinfo:
+            _client(session).get_project()
+        assert excinfo.value.code == "GCP_UNREACHABLE" and session.calls == 5
+
+    def test_transient_google_errors_are_retried(self) -> None:
+        session = _FlakySession(1, 503)
+        assert _client(session).get_project()["projectId"] == "p"
+
+    def test_permanent_errors_are_not_retried(self) -> None:
+        session = _FlakySession(99, 403)
+        with pytest.raises(PlatformError):
+            _client(session).get_project()
+        assert session.calls == 1

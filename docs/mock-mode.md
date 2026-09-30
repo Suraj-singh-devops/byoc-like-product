@@ -41,6 +41,12 @@ error, then succeed on retry.
 
 ## Deterministic failure triggers
 
+- **elasticsearch.yml setting refused at startup:** a setting whose name starts with `unknown.`
+  (e.g. `unknown.setting: 1` on the Configuration page) makes the simulated node refuse to start,
+  like a real node with an unknown setting. The first node is rolled back and the change fails with
+  `CONFIG_REJECTED` ([ADR 0018](adr/0018-elasticsearch-yml-settings.md)).
+
+
 Mock mode simulates two clouds, GCP and AWS ([ADR 0014](adr/0014-aws-support.md)), on the same
 simulated VMs.
 

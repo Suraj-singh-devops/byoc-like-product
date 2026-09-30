@@ -4,6 +4,7 @@ package report
 import (
 	"time"
 
+	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/configsync"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/elasticsearch"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/system"
 )
@@ -20,4 +21,6 @@ type Report struct {
 	CollectedAt   time.Time            `json:"collected_at"`
 	System        system.Metrics       `json:"system"`
 	Engine        elasticsearch.Report `json:"engine"`
+	// Config is what configuration the node runs (docs/adr/0017); absent without config sync.
+	Config *configsync.Status `json:"config,omitempty"`
 }

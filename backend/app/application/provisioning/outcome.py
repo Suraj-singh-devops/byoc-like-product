@@ -70,6 +70,7 @@ _LABELS = {
     OperationType.CREATE_CLUSTER: ("CREATE", "Provisioning"),
     OperationType.SCALE_CLUSTER: ("SCALE", "Scaling"),
     OperationType.DELETE_CLUSTER: ("DELETE", "Deletion"),
+    OperationType.UPDATE_CONFIG: ("CONFIG", "Configuration change"),
 }
 
 
@@ -106,6 +107,15 @@ def _cluster_outcome(
         message = (
             f"Scaling to {params.get('to')} nodes {verb}: {detail}. The cluster keeps running on its existing "
             "nodes; retry the operation to finish scaling."
+        )
+        severity = EventSeverity.INFO if cancelled else EventSeverity.WARNING
+    elif kind == OperationType.UPDATE_CONFIG:
+        # The cluster keeps serving: nodes run either the previous or the new configuration.
+        expected, target = ClusterLifecycle.UPDATING, ClusterLifecycle.ACTIVE
+        verb = "was cancelled" if cancelled else "failed"
+        message = (
+            f"The configuration change {verb}: {detail}. The cluster keeps running; change the setting and "
+            "apply again, or retry the operation."
         )
         severity = EventSeverity.INFO if cancelled else EventSeverity.WARNING
     else:

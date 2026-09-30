@@ -10,6 +10,9 @@ locals {
   hostnames            = { for name, node in var.nodes : name => "${var.name_prefix}-${name}.${node.zone}.c.${var.project_id}.internal" }
   seed_hosts           = [for name in var.seed_nodes : "${local.hostnames[name]}:9300"]
   node_zones           = distinct([for node in values(var.nodes) : node.zone])
+  load_balanced        = length(var.load_balancer_nodes) > 0
+  # Only nodes behind the load balancer accept Google's health-check probes.
+  lb_tag = "${local.network_tag}-lb"
 }
 
 module "network" {
@@ -72,7 +75,8 @@ resource "tls_private_key" "node" {
 resource "tls_cert_request" "node" {
   private_key_pem = tls_private_key.node.private_key_pem
   dns_names       = concat(["localhost"], [for zone in local.node_zones : "*.${zone}.c.${var.project_id}.internal"])
-  ip_addresses    = ["127.0.0.1"]
+  # The load balancer's private address, so clients verify the certificate at the endpoint too.
+  ip_addresses = concat(["127.0.0.1"], local.load_balanced ? [google_compute_address.endpoint[0].address] : [])
 
   subject {
     common_name  = var.es_cluster_name
@@ -133,7 +137,7 @@ module "storage" {
   source            = "../storage"
   project_id        = var.project_id
   name_prefix       = var.name_prefix
-  nodes             = { for name, node in var.nodes : name => { zone = node.zone } }
+  nodes             = { for name, node in var.nodes : name => { zone = node.zone, size_gb = node.data_disk_size_gb } }
   size_gb           = var.data_disk_size_gb
   type              = var.data_disk_type
   kms_key_self_link = var.kms_key_self_link
@@ -141,10 +145,18 @@ module "storage" {
 }
 
 module "compute" {
-  source                = "../compute"
-  project_id            = var.project_id
-  name_prefix           = var.name_prefix
-  nodes                 = var.nodes
+  source      = "../compute"
+  project_id  = var.project_id
+  name_prefix = var.name_prefix
+  nodes = {
+    for name, node in var.nodes : name => {
+      zone         = node.zone
+      ordinal      = node.ordinal
+      roles        = node.roles
+      machine_type = node.machine_type
+      tags         = contains(var.load_balancer_nodes, name) ? [local.lb_tag] : []
+    }
+  }
   machine_type          = var.machine_type
   architecture          = var.architecture
   boot_disk_size_gb     = var.boot_disk_size_gb
@@ -173,12 +185,23 @@ module "compute" {
     "byoc-agent-version"              = var.agent_version
     "byoc-control-plane-url"          = var.control_plane_url
     "byoc-agent-audience"             = var.agent_audience
+    # Topology and configuration (docs/adr/0016, docs/adr/0017). Changing these updates the
+    # metadata in place; a node re-renders its configuration only when its own
+    # byoc-config-generation changes, and live settings are applied by the agent.
+    "byoc-es-layout"                = var.layout
+    "byoc-es-forced-awareness"      = join(",", var.forced_awareness_zones)
+    "byoc-es-cluster-settings"      = jsonencode(var.cluster_settings)
+    "byoc-es-cluster-settings-hash" = var.cluster_settings_hash
+    "byoc-es-node-settings"         = jsonencode(var.node_settings)
+    "byoc-es-heap-percent"          = tostring(var.heap_percent)
+    "byoc-apply-config"             = file("${path.module}/scripts/apply-config.sh")
   }
 
   node_metadata = {
     for name, node in var.nodes : name => {
-      "byoc-node-name"  = name
-      "byoc-node-roles" = join(",", node.roles)
+      "byoc-node-name"         = name
+      "byoc-node-roles"        = length(node.roles) > 0 ? join(",", node.roles) : "none"
+      "byoc-config-generation" = tostring(node.config_generation)
     }
   }
 

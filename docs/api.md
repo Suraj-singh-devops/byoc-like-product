@@ -53,11 +53,13 @@ actions from `permissions` in `GET /auth/me`. Resources of other organizations a
 | `DELETE /networks/{id}` | `network:manage` | 409 `NETWORK_IN_USE` while clusters that are not deleted use it. The VPC is never touched |
 | `GET /cloud-accounts/{id}/catalog` | `cloud_account:read` | Regions/zones and storage types |
 | `GET /cloud-accounts/{id}/machine-types?zone=` | `cloud_account:read` | Supported machine types in a zone |
-| `GET /engines` | authenticated | Engine catalog: exact versions with status and license-review status, limits, metrics |
+| `GET /engines` | authenticated | Engine catalog: exact versions with status and license-review status, limits, metrics, node groups of the dedicated layout, changeable settings |
 | `POST /clusters` | `cluster:create` | **202** `{cluster_id, operation_id, lifecycle}` |
 | `GET /clusters` | `cluster:read` | `?include_deleted=true&environment_id=`; each cluster has `lifecycle`, `health`, `environment`, `network`, `zones` |
 | `GET /clusters/{id}` | `cluster:read` | Desired/actual state, nodes, health details |
-| `POST /clusters/{id}/scale` | `cluster:scale` | `{node_count}` larger than now → **202** |
+| `POST /clusters/{id}/scale` | `cluster:scale` | `{node_count, group?}` larger than now → **202**; `group` (`data` or `coordinating`) for the dedicated layout |
+| `GET /clusters/{id}/config` | `cluster:read` | Settings catalog, `desired` and `applied` settings, `pending` keys, `custom` elasticsearch.yml settings, `config_file` (the rendered elasticsearch.yml per node group and the platform-owned keys) |
+| `PUT /clusters/{id}/config` | `cluster:configure` (Owner, Admin) | `{settings: {key: value \| null}}` → **202**, an `UPDATE_CONFIG` operation; see [Configuration](#configuration) |
 | `DELETE /clusters/{id}?confirm=<name>` | `cluster:delete` | **202**; see [Deleting a cluster](#deleting-a-cluster) |
 | `POST /clusters/{id}/health-check` | `cluster:health_check` | **202**, a `HEALTH_CHECK` operation |
 | `GET /clusters/{id}/health` | `cluster:read` | Lifecycle, health, infrastructure and engine components, reasons, warnings, per-node health |
@@ -109,6 +111,67 @@ Idempotency-Key: 5f0e6f7c-...
   availability zones (`422`, field `high_availability`).
 - The subnets must have a free address per node (`422`, field `node_count`).
 - Poll `GET /operations/{operation_id}` for progress.
+
+### Dedicated master, data and coordinating nodes
+
+[ADR 0016](adr/0016-ha-topology-dedicated-roles.md). Send `layout: "dedicated"` and
+`node_groups` instead of `machine_type`, `node_count` and `storage_gb`:
+
+```json
+{
+  "name": "production-search",
+  "environment_id": "…",
+  "network_id": "…",
+  "storage_type": "pd-balanced",
+  "high_availability": true,
+  "layout": "dedicated",
+  "node_groups": {
+    "master": {"count": 3, "machine_type": "e2-standard-4", "storage_gb": 20},
+    "data": {"count": 3, "machine_type": "e2-standard-8", "storage_gb": 500},
+    "coordinating": {"count": 2, "machine_type": "e2-standard-4", "storage_gb": 20}
+  },
+  "config": {"search.max_buckets": 20000}
+}
+```
+
+- Exactly 3 masters, one per zone. With `high_availability`: at least 2 data and 2
+  coordinating nodes, three zones. Errors name the field, e.g. `node_groups.master.count`.
+- All groups use the same CPU architecture.
+- Nodes are named `master-N`, `data-N` and `coord-N`. The cluster's `endpoint` is the
+  internal load balancer (`https://<private-ip>:9200`) in front of the coordinating nodes.
+- `config` (optional, both layouts) sets initial [settings](#configuration).
+
+## Configuration
+
+[ADR 0017](adr/0017-configuration-management.md), [ADR 0018](adr/0018-elasticsearch-yml-settings.md).
+`GET /engines` and `GET /clusters/{id}/config` list the typed settings. Besides them, **any
+elasticsearch.yml setting** can be sent, except the ones the platform owns (`xpack.security.*`,
+`network.*`, `http.port`, `transport.*`, `discovery.*`, `cluster.name`, `node.name`, `node.roles`,
+`node.attr.*`, `path.*`, `bootstrap.*`, zone awareness; the full list is `config_file.reserved_prefixes`).
+
+```http
+PUT /api/v1/clusters/{id}/config
+Idempotency-Key: …
+
+{"settings": {"cluster.routing.allocation.disk.watermark.low": "80%", "thread_pool.write.queue_size": 20000,
+              "search.max_buckets": null}}
+```
+
+- `null` goes back to the default (removes the line). Typed values are validated and normalized
+  (`"100 MB"` → `"100mb"`); disk watermarks must increase. Other elasticsearch.yml settings take
+  single-line text, numbers, booleans or lists (written comma-separated), are written as quoted
+  strings, and at most 64 of them. Rejected keys come back in `details.fields` (`422`).
+- If Elasticsearch refuses a setting on restart (unknown setting, unparsable value), that node is
+  put back on its previous elasticsearch.yml, the operation fails with `CONFIG_REJECTED` and
+  Elasticsearch's reason, and no other node is changed. Correct or remove the setting and apply
+  again.
+- `dynamic` settings apply live (the elected master's agent runs `PUT _cluster/settings`).
+  `static` ones need a rolling restart: one node at a time, data nodes first, then coordinating,
+  then masters with the elected master last, waiting for the cluster to be healthy after each.
+- The cluster moves to `UPDATING` and keeps serving. One change at a time (`409`); nothing to
+  change returns `422 NO_CHANGE`. A failed change returns the cluster to `ACTIVE`; retry resumes
+  the rolling restart where it stopped.
+- Audit events `CLUSTER_CONFIG_UPDATE_STARTED` and `CLUSTER_CONFIG_UPDATED`.
 
 ## Scaling
 

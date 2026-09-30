@@ -133,7 +133,7 @@ export default function ClustersPage() {
                       <LifecycleBadge lifecycle={c.lifecycle} />
                     </td>
                     <td>
-                      {c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING" ? (
+                      {c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING" || c.lifecycle === "UPDATING" ? (
                         <HealthBadge health={c.health} />
                       ) : (
                         <span className="muted">-</span>

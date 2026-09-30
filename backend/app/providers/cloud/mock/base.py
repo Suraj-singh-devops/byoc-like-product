@@ -159,10 +159,15 @@ class SimulatedCloudProvider(CloudProvider):
             for _, message in self.foundation(request):
                 progress.message(message)
                 self._pause(0.9, progress)
-        machine = next((m for m in self.descriptor.machine_types if m.name == request.machine_type), None)
+        generations = request.engine_settings.get("node_generations") or {}
         for node in sorted(request.nodes, key=lambda n: n.ordinal):
+            config = self.node_config(request, node, generations)
             if node.name in existing:
+                # Metadata updates in place (docs/adr/0017): no VM is replaced.
+                self.dataplane.update_config(request.cluster_id, node.name, config)
                 continue
+            machine_type = node.machine_type or request.machine_type
+            machine = next((m for m in self.descriptor.machine_types if m.name == machine_type), None)
             disk_message, vm_message = self.node_messages(request, node)
             progress.message(disk_message)
             self._pause(0.5, progress)
@@ -181,12 +186,32 @@ class SimulatedCloudProvider(CloudProvider):
                 labels={
                     **request.labels,
                     "cluster_name": request.engine_settings.get("cluster_name", ""),
-                    "storage_gb": request.storage_gb,
+                    "storage_gb": node.storage_gb or request.storage_gb,
                     "memory_gb": machine.memory_gb if machine else 16,
                     **({"hostname": self.hostname(request, node.zone, instance_name, ip)} if ip else {}),
+                    **config,
                 },
             )
         return self._state(request)
+
+    @staticmethod
+    def node_config(request: InfrastructureRequest, node: NodePlacement, generations: dict[str, Any]) -> dict[str, Any]:
+        """The metadata a node's agent acts on: its roles, the live settings and its config generation."""
+        return {
+            "roles": list(node.roles),
+            "group": node.group,
+            "ordinal": node.ordinal,
+            "cluster_settings_hash": request.engine_settings.get("cluster_settings_hash"),
+            "config_generation": int(generations.get(node.name, 0)),
+            "node_settings_keys": sorted((request.engine_settings.get("node_settings") or {}).keys()),
+        }
+
+    def load_balancer_ip(self, request: InfrastructureRequest) -> str | None:
+        """The internal load balancer's address: a fixed, high address of the first subnet."""
+        if not request.load_balancer_nodes or request.network is None:
+            return None
+        subnet = ipaddress.ip_network(request.network.subnets[0].cidr, strict=False)
+        return str(subnet[subnet.num_addresses - 6])
 
     def _state(self, request: InfrastructureRequest) -> InfrastructureState:
         nodes = [

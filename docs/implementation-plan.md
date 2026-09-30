@@ -91,6 +91,15 @@ AWS track: A2 after P1b; A1 after P4; A3 after P5, A1 and A2; A4 after A3
 - [x] Frontend, seed data, e2e test, docs updated
 - [x] All test suites green; e2e green on a fresh stack and on the upgraded local stack
 
+## P3c checklist: HA topology and configuration (built and tested locally, 2026-09-30)
+
+- [x] Dedicated layout ([ADR 0016](adr/0016-ha-topology-dedicated-roles.md)): 3 masters, data and coordinating groups with their own machine types and disks, forced zone awareness, role-aware health, scale by group, Alembic 0005
+- [x] Internal load balancer in the GCP module (private address in the node certificate, health-check firewall on the load-balanced nodes only); provisioner permissions; simulated in mock mode
+- [x] Configuration ([ADR 0017](adr/0017-configuration-management.md)): allowlisted settings, `GET`/`PUT /clusters/{id}/config`, `UPDATE_CONFIG` with live apply and rolling restart (elected master last), resumable retry, `cluster:configure` for Owner and Admin, audit events
+- [x] Agent `configsync` (compiled-in allowlist, elected master applies, every node reports hash and generation) and `apply-config`; allowlists checked identical across backend, agent, Terraform and script
+- [x] Console: topology choice and group editor in the wizard, groups and endpoint on the cluster page, configuration editor with review, scale by group
+- [ ] Real run on the sandbox project (8 VMs + load balancer; needs approval: billable)
+
 ## P3 checklist (built and tested locally, 2026-09-29; live GKE rollout awaits approval)
 
 - [x] `infrastructure/terraform/platform`: VPC, private GKE Autopilot, Cloud SQL (private IP, IAM login, CMEK), Artifact Registry, per-workload GSAs with Workload Identity, Secret Manager secret containers, KMS, state bucket, managed certificate; plan tests with mocked providers

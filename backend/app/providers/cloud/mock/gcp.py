@@ -76,6 +76,27 @@ DEDICATED_VPC_RESOURCES = (
         "Creating firewall rule: allow 9200/9300 from the cluster subnet only",
     ),
 )
+# Dedicated layout (docs/adr/0016): internal TCP load balancer in front of the coordinating nodes.
+LOAD_BALANCER_RESOURCES = (
+    ("module.cluster.google_compute_address.endpoint[0]", "Reserving the endpoint's private IP address"),
+    ("module.cluster.google_compute_region_health_check.endpoint[0]", "Creating health check (TCP 9200)"),
+    (
+        "module.cluster.google_compute_firewall.endpoint_health_checks[0]",
+        "Creating firewall rule: Google health checkers to 9200 on the coordinating nodes only",
+    ),
+)
+# One unmanaged instance group per zone of the load-balanced nodes.
+LOAD_BALANCER_GROUP = 'module.cluster.google_compute_instance_group.endpoint["{zone}"]'
+LOAD_BALANCER_FRONTEND = (
+    (
+        "module.cluster.google_compute_region_backend_service.endpoint[0]",
+        "Creating internal backend service for the coordinating nodes",
+    ),
+    (
+        "module.cluster.google_compute_forwarding_rule.endpoint[0]",
+        "Creating internal load balancer (one private IP, port 9200)",
+    ),
+)
 NODE_RESOURCES = (
     'module.cluster.module.storage.google_compute_disk.data["{node}"]',
     'module.cluster.module.compute.google_compute_instance.node["{node}"]',
@@ -216,7 +237,14 @@ class MockGcpProvider(SimulatedCloudProvider):
         else:
             resources = NETWORK_RESOURCES
             values = {"vpc": network.vpc.rsplit("/", 1)[-1], "cidrs": ", ".join(network.cidrs)}
-        return tuple((address, message.format(**values)) for address, message in resources + CLUSTER_RESOURCES)
+        lb: tuple[tuple[str, str], ...] = ()
+        if request.load_balancer_nodes:
+            zones = sorted({n.zone for n in request.nodes if n.name in request.load_balancer_nodes})
+            groups = tuple(
+                (LOAD_BALANCER_GROUP.format(zone=z), f"Creating instance group for the endpoint in {z}") for z in zones
+            )
+            lb = LOAD_BALANCER_RESOURCES + groups + LOAD_BALANCER_FRONTEND
+        return tuple((address, message.format(**values)) for address, message in resources + CLUSTER_RESOURCES + lb)
 
     def teardown_messages(self, request: InfrastructureRequest) -> tuple[str, ...]:
         common = (
@@ -229,9 +257,10 @@ class MockGcpProvider(SimulatedCloudProvider):
 
     def node_messages(self, request: InfrastructureRequest, node: NodePlacement) -> tuple[str, str]:
         instance = request.instance_name(node.name)
+        size = node.storage_gb or request.storage_gb
         return (
-            f"Creating disk {instance}-data ({request.storage_gb} GB {request.storage_type}, encrypted)",
-            f"Creating VM {instance} ({request.machine_type}, {node.zone}, no public IP)",
+            f"Creating disk {instance}-data ({size} GB {request.storage_type}, encrypted)",
+            f"Creating VM {instance} ({node.machine_type or request.machine_type}, {node.zone}, no public IP)",
         )
 
     def instance_id(self, project_id: str, zone: str, instance_name: str) -> str:
@@ -257,4 +286,5 @@ class MockGcpProvider(SimulatedCloudProvider):
             },
             "artifacts_bucket": f"{prefix}-art-mock",
             "http_endpoints": [f"https://{n.private_ip}:9200" for n in nodes],
+            "endpoint": f"https://{lb}:9200" if (lb := self.load_balancer_ip(request)) else None,
         }

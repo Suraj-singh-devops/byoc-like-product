@@ -190,7 +190,11 @@ def build_handlers(platform: Platform) -> dict[str, Handler]:
             network = NetworkRef.from_doc(payload["network"])
             verify_network(cloud, account_ctx, network, payload["region"], task.progress)
         machine = cloud.validate_placement(account_ctx, payload["region"], payload["zone"], payload["machine_type"])
-        return {"machine": asdict(machine)}
+        machines = {
+            name: asdict(cloud.validate_placement(account_ctx, payload["region"], payload["zone"], name))
+            for name in payload.get("machine_types") or []
+        }
+        return {"machine": asdict(machine), "machines": machines}
 
     def plan(task: TaskContext) -> dict[str, Any]:
         cloud, account_ctx = access(task)

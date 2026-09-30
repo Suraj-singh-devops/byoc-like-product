@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.providers.cloud.base import InfrastructureRequest
+from app.providers.cloud.base import InfrastructureRequest, NodePlacement
 from app.providers.cloud.gcp.catalog import architecture_for
 
 REQUIRED_PROVIDERS = {
@@ -40,6 +40,7 @@ ROOT_OUTPUTS = (
     "secrets",
     "artifacts_bucket",
     "http_endpoints",
+    "endpoint",
 )
 PLAN_FILE = "tfplan"
 
@@ -58,6 +59,7 @@ def module_variables(
     agent_audience: str,
 ) -> dict[str, Any]:
     settings = request.engine_settings
+    generations = dict(settings.get("node_generations") or {})
     network: dict[str, Any] = {}
     if request.network is not None:
         # The customer's registered network (docs/adr/0013): paths and range from the validated
@@ -77,10 +79,7 @@ def module_variables(
         "name_prefix": request.resource_prefix,
         "project_id": request.project_id,
         "region": request.region,
-        "nodes": {
-            n.name: {"zone": n.zone, "ordinal": n.ordinal, "roles": list(n.roles)}
-            for n in sorted(request.nodes, key=lambda n: n.ordinal)
-        },
+        "nodes": {n.name: _node(n, generations) for n in sorted(request.nodes, key=lambda n: n.ordinal)},
         "machine_type": request.machine_type,
         "architecture": architecture_for(request.machine_type),
         "data_disk_size_gb": request.storage_gb,
@@ -92,11 +91,30 @@ def module_variables(
         "seed_nodes": settings["seed_nodes"],
         "initial_master_nodes": settings["initial_master_nodes"],
         "zone_awareness": settings["zone_awareness"],
+        # Topology and configuration (docs/adr/0016, docs/adr/0017).
+        "layout": settings.get("layout", "combined"),
+        "forced_awareness_zones": list(settings.get("forced_awareness_zones") or []),
+        "load_balancer_nodes": list(request.load_balancer_nodes),
+        "cluster_settings": dict(settings.get("cluster_settings") or {}),
+        "cluster_settings_hash": str(settings.get("cluster_settings_hash") or ""),
+        "node_settings": dict(settings.get("node_settings") or {}),
+        "heap_percent": int(settings.get("heap_percent") or 50),
         "agent_binary_path": agent.path if agent else "",
         "agent_version": agent.version if agent else "",
         "control_plane_url": control_plane_url,
         "agent_audience": agent_audience,
     }
+
+
+def _node(node: NodePlacement, generations: dict[str, int]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {"zone": node.zone, "ordinal": node.ordinal, "roles": list(node.roles)}
+    if node.machine_type:
+        rendered["machine_type"] = node.machine_type
+    if node.storage_gb:
+        rendered["data_disk_size_gb"] = node.storage_gb
+    if generations.get(node.name):
+        rendered["config_generation"] = int(generations[node.name])
+    return rendered
 
 
 def backend_config(request: InfrastructureRequest) -> dict[str, Any]:

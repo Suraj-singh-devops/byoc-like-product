@@ -13,8 +13,8 @@ infrastructure ([ADR 0005](adr/0005-terraform-only-writer-state-and-secrets.md))
 |---|---|
 | `network` | New clusters: only firewall rules (engine ports from the registered subnet's range to the cluster's tag) in the customer's existing network, passed as resource paths with the range from the platform's lookup, so no data source reads the network ([ADR 0013](adr/0013-environments-and-registered-networks.md)). Clusters created before P1b: a dedicated VPC + subnet, Cloud Router + NAT. Optional client CIDRs (never `0.0.0.0/0`), optional IAP SSH. |
 | `iam` | The node service account (no project roles by default) |
-| `storage` | One Persistent Disk per node (`pd-balanced`/`pd-ssd`/`pd-standard`, optional CMEK) |
-| `compute` | Shielded VMs, no external IP, data disk attached as `data`, guest attributes on, OS Login on, project SSH keys blocked |
+| `storage` | One Persistent Disk per node (`pd-balanced`/`pd-ssd`/`pd-standard`, optional CMEK), optional size per node |
+| `compute` | Shielded VMs, no external IP, data disk attached as `data`, guest attributes on, OS Login on, project SSH keys blocked; optional machine type and extra tags per node |
 | `artifacts` | Private bucket (public access prevention) holding the agent binary; read access for the node SA only |
 | `elasticsearch` | The engine stack: composes the modules above, generates a CA, node certificate and `elastic` password into Secret Manager (per-secret access for the node SA) and ships the bootstrap script, which installs exactly `es_version` after verifying the signing key fingerprint and the package SHA-256 from `es_package` |
 | `control-plane-access` | One-time customer onboarding: APIs, custom role, provisioner service account, impersonation grant |
@@ -52,6 +52,32 @@ them, through `destroy`). Boot image drift is ignored in the module
 the control plane's own secrets are never passed. State and plan files
 are encrypted client-side (AES-GCM, PBKDF2 key derived per cluster from `SECRET_KEY`).
 Plans are deleted after apply, and a destroyed cluster's local workspace is removed.
+
+## Dedicated layout and configuration
+
+[ADR 0016](adr/0016-ha-topology-dedicated-roles.md), [ADR 0017](adr/0017-configuration-management.md).
+
+- `nodes` entries carry the node's own `machine_type`, `data_disk_size_gb` and
+  `config_generation`; coordinating nodes have `roles = []` (metadata `byoc-node-roles=none`).
+- `load_balancer_nodes` (the coordinating nodes) adds `load_balancer.tf`: a reserved internal
+  address, one unmanaged instance group per zone, a TCP health check on 9200, a regional internal
+  backend service and an `INTERNAL` forwarding rule on port 9200 only. A firewall rule lets
+  Google's health-check ranges reach 9200 on the load-balanced nodes only (by an extra tag). The
+  address is added to the node certificate, so clients verify TLS at the endpoint. Output
+  `endpoint`.
+- `cluster_settings`, `node_settings` and `heap_percent` travel in metadata
+  (`byoc-es-cluster-settings`, `byoc-es-node-settings`, `byoc-es-heap-percent`); variable
+  validation accepts only the allowlisted keys and plain values. Metadata changes are applied in
+  place; nothing restarts because of them.
+- `node_settings` holds the user's elasticsearch.yml settings ([ADR 0018](adr/0018-elasticsearch-yml-settings.md)):
+  any dotted key except the platform-owned ones, single-line values.
+- `scripts/apply-config.sh` is installed as `/opt/byoc/bin/apply-config` and renders
+  `elasticsearch.yml` (the platform's lines, then the user's settings as quoted strings) and the heap
+  options (forced zone awareness included). With `--restart` it keeps the running files and restores
+  them if the node does not start, recording the rejected generation in `/var/lib/byoc/config-failed`.
+  Tests: `make test-scripts`. The agent runs it
+  with `--restart` when its node's `byoc-config-generation` changes; the control plane changes one
+  node's generation per apply.
 
 ## Scaling
 

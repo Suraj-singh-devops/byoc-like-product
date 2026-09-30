@@ -41,6 +41,14 @@ type Config struct {
 	StateDir        string `json:"state_dir"`
 	MetadataURL     string `json:"metadata_url"`
 	ProcRoot        string `json:"proc_root"`
+
+	// ConfigSync applies the platform's configuration from instance metadata (docs/adr/0017):
+	// allowlisted live settings on the elected master, and a restart through ApplyConfigPath
+	// when this node's byoc-config-generation changes.
+	ConfigSync       bool   `json:"config_sync"`
+	ApplyConfigPath  string `json:"apply_config_path"`
+	ConfigStateFile  string `json:"config_state_file"`
+	ConfigFailedFile string `json:"config_failed_file"`
 }
 
 var nodeNameRe = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
@@ -105,6 +113,7 @@ func applyEnv(cfg *Config) {
 		"BYOC_AGENT_ALLOW_INSECURE_CONTROL_PLANE":       &cfg.AllowInsecureControlPlane,
 		"BYOC_AGENT_ELASTICSEARCH_INSECURE_SKIP_VERIFY": &cfg.ElasticsearchInsecureSkipVerify,
 		"BYOC_AGENT_GUEST_ATTRIBUTES":                   &cfg.GuestAttributes,
+		"BYOC_AGENT_CONFIG_SYNC":                        &cfg.ConfigSync,
 	}
 	for key, target := range flags {
 		if value, ok := os.LookupEnv(key); ok {
@@ -141,6 +150,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.StateDir == "" {
 		cfg.StateDir = "/var/lib/byoc-agent"
+	}
+	if cfg.ApplyConfigPath == "" {
+		cfg.ApplyConfigPath = "/opt/byoc/bin/apply-config"
+	}
+	if cfg.ConfigStateFile == "" {
+		cfg.ConfigStateFile = "/var/lib/byoc/config-generation"
+	}
+	if cfg.ConfigFailedFile == "" {
+		cfg.ConfigFailedFile = "/var/lib/byoc/config-failed"
 	}
 	if cfg.MetadataURL == "" {
 		cfg.MetadataURL = "http://metadata.google.internal/computeMetadata/v1"

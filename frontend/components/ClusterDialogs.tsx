@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 
 import { api, newIdempotencyKey } from "@/lib/api";
-import type { ClusterDetail, OperationAccepted } from "@/lib/types";
+import type { ClusterDetail, NodeGroupName, OperationAccepted } from "@/lib/types";
 
 import { Alert, Dialog, ErrorAlert, Field } from "./ui";
 
@@ -16,13 +16,22 @@ export function ScaleDialog({
   onClose: () => void;
   onDone: (operationId: string) => void;
 }) {
-  const current = cluster.nodes.length || cluster.node_count;
-  const [target, setTarget] = useState(current + (cluster.high_availability ? 2 : 1));
+  // Dedicated layout (docs/adr/0016): data and coordinating groups grow separately; masters stay at 3.
+  const dedicated = cluster.layout === "dedicated";
+  const scalable = cluster.node_groups.filter((g) => g.name !== "master");
+  const [group, setGroup] = useState<NodeGroupName>("data");
+  const groupCount = (name: NodeGroupName) =>
+    cluster.nodes.filter((n) => n.node_group === name).length ||
+    (cluster.node_groups.find((g) => g.name === name)?.count ?? 0);
+  const current = dedicated ? groupCount(group) : cluster.nodes.length || cluster.node_count;
+  const [target, setTarget] = useState(current + (!dedicated && cluster.high_availability ? 2 : 1));
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const key = useRef(newIdempotencyKey());
   // Scale-up only in this release: removing nodes needs shard relocation (docs/adr/0010).
   const invalid = target <= current || target > 30;
+  const selected = cluster.node_groups.find((g) => g.name === group);
+  const noun = dedicated ? `${group} node` : "node";
 
   const submit = async () => {
     setBusy(true);
@@ -31,7 +40,7 @@ export function ScaleDialog({
       const result = await api<OperationAccepted>(`/clusters/${cluster.id}/scale`, {
         method: "POST",
         headers: { "Idempotency-Key": key.current },
-        body: { node_count: target },
+        body: dedicated ? { node_count: target, group } : { node_count: target },
       });
       onDone(result.operation_id);
     } catch (err) {
@@ -51,16 +60,36 @@ export function ScaleDialog({
             Cancel
           </button>
           <button className="button button-primary" onClick={submit} disabled={busy || invalid}>
-            {busy ? "Starting..." : `Scale to ${target} nodes`}
+            {busy ? "Starting..." : `Scale to ${target} ${noun}s`}
           </button>
         </>
       }
     >
       <ErrorAlert error={error} />
+      {dedicated ? (
+        <Field label="Node group" htmlFor="scale-group" hint="Master nodes stay at three, one per zone.">
+          <select
+            id="scale-group"
+            className="select"
+            value={group}
+            onChange={(e) => {
+              const next = e.target.value as NodeGroupName;
+              setGroup(next);
+              setTarget(groupCount(next) + 1);
+            }}
+          >
+            {scalable.map((g) => (
+              <option key={g.name} value={g.name}>
+                {g.name} ({groupCount(g.name)} × {g.machine_type})
+              </option>
+            ))}
+          </select>
+        </Field>
+      ) : null}
       <Field
-        label="Number of nodes"
+        label={`Number of ${noun}s`}
         htmlFor="scale-target"
-        hint={`Currently ${current} node${current === 1 ? "" : "s"}. Choose a larger number; scaling down is not available yet.`}
+        hint={`Currently ${current} ${noun}${current === 1 ? "" : "s"}. Choose a larger number; scaling down is not available yet.`}
       >
         <input
           id="scale-target"
@@ -74,8 +103,15 @@ export function ScaleDialog({
       </Field>
       {target > current ? (
         <p className="muted">
-          {target - current} node{target - current === 1 ? "" : "s"} will be created with the same machine type and
-          storage, then join the cluster. Shards rebalance automatically.
+          {target - current} {noun}
+          {target - current === 1 ? "" : "s"} will be created with{" "}
+          {dedicated && selected
+            ? `${selected.machine_type} and ${selected.storage_gb} GB`
+            : "the same machine type and storage"}
+          , then join the cluster.{" "}
+          {dedicated && group === "coordinating"
+            ? "The load balancer starts sending requests to them once they are healthy."
+            : "Shards rebalance automatically."}
         </p>
       ) : (
         <Alert tone="warning" title="Only scaling up is supported">

@@ -98,6 +98,10 @@ class ClusterNode(IdMixin, TimestampMixin, Base):
     private_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     zone: Mapped[str] = mapped_column(String(50))
     role: Mapped[str] = mapped_column(String(60))
+    # Dedicated layout (docs/adr/0016): master, data or coordinating, with its own machine type.
+    # NULL for combined-layout nodes, which use the cluster's machine type.
+    node_group: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    machine_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
     lifecycle_state: Mapped[str] = mapped_column(String(20))
     health: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
     health_reasons: Mapped[list[str]] = mapped_column(JSONType, default=list)

@@ -8,6 +8,9 @@ document format below, and the control plane reconciles the actual state towards
     cloud: {provider, accountId, project, region, zone, zones}
     environment: {id, name, type}
     network: {id, name, vpc, subnets: [{id, cidr, zone}]}
+    layout: combined | dedicated
+    nodeGroups: [{name, count, machineType, storageGB}]    (dedicated layout, docs/adr/0016)
+    config: {setting: value}                              (overrides, docs/adr/0017)
     compute: {machineType}
     storage: {sizeGB, type}
     nodes: {count}
@@ -57,6 +60,32 @@ class EnvironmentRef:
 
 
 @dataclass(frozen=True)
+class NodeGroupSpec:
+    """A group of nodes with one role in a dedicated layout (the engine defines the groups)."""
+
+    name: str
+    count: int
+    machine_type: str
+    storage_gb: int
+
+    def to_doc(self) -> dict[str, Any]:
+        return {"name": self.name, "count": self.count, "machineType": self.machine_type, "storageGB": self.storage_gb}
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> NodeGroupSpec:
+        return cls(
+            name=str(doc["name"]),
+            count=int(doc["count"]),
+            machine_type=str(doc["machineType"]),
+            storage_gb=int(doc["storageGB"]),
+        )
+
+
+COMBINED = "combined"
+DEDICATED = "dedicated"
+
+
+@dataclass(frozen=True)
 class ClusterSpec:
     name: str
     engine: str
@@ -75,9 +104,26 @@ class ClusterSpec:
     network: NetworkRef | None = None
     # Zones chosen at creation (the first is ``zone``); nodes are placed round-robin over them.
     zones: tuple[str, ...] = ()
+    # combined: every node runs the same roles (node_count, machine_type, storage_gb).
+    # dedicated: node_groups, each with its own count, machine type and disk; node_count is their
+    # total and machine_type/storage_gb describe the data group.
+    layout: str = COMBINED
+    node_groups: tuple[NodeGroupSpec, ...] = ()
+    # Configuration overrides (setting => value), validated by the engine's settings catalog.
+    config: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def with_node_count(self, node_count: int) -> ClusterSpec:
         return dataclasses.replace(self, node_count=node_count)
+
+    def group(self, name: str) -> NodeGroupSpec | None:
+        return next((g for g in self.node_groups if g.name == name), None)
+
+    def with_group_count(self, name: str, count: int) -> ClusterSpec:
+        groups = tuple(dataclasses.replace(g, count=count) if g.name == name else g for g in self.node_groups)
+        return dataclasses.replace(self, node_groups=groups, node_count=sum(g.count for g in groups))
+
+    def with_config(self, config: dict[str, Any]) -> ClusterSpec:
+        return dataclasses.replace(self, config=dict(config))
 
     def to_desired_state(self, generation: int) -> dict[str, Any]:
         cloud: dict[str, Any] = {
@@ -103,6 +149,11 @@ class ClusterSpec:
             doc["environment"] = self.environment.to_doc()
         if self.network is not None:
             doc["network"] = self.network.to_doc()
+        if self.layout != COMBINED:
+            doc["layout"] = self.layout
+            doc["nodeGroups"] = [g.to_doc() for g in self.node_groups]
+        if self.config:
+            doc["config"] = dict(self.config)
         return doc
 
     @classmethod
@@ -125,6 +176,9 @@ class ClusterSpec:
                 environment=EnvironmentRef.from_doc(doc["environment"]) if doc.get("environment") else None,
                 network=NetworkRef.from_doc(doc["network"]) if doc.get("network") else None,
                 zones=tuple(doc["cloud"].get("zones") or ()),
+                layout=str(doc.get("layout") or COMBINED),
+                node_groups=tuple(NodeGroupSpec.from_doc(g) for g in doc.get("nodeGroups") or ()),
+                config=dict(doc.get("config") or {}),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValidationFailed(f"Desired state document is malformed: {exc}") from exc

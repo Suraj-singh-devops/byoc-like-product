@@ -57,6 +57,7 @@ export function LifecycleBadge({ lifecycle }: { lifecycle: ClusterLifecycle }) {
     case "CREATING":
     case "SCALING":
     case "UPGRADING":
+    case "UPDATING":
     case "DELETING":
       return <Badge tone="accent" icon="loader" label={humanize(lifecycle)} spin />;
     case "FAILED":

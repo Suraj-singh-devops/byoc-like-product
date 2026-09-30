@@ -161,6 +161,11 @@ class NodePlacement:
     ordinal: int
     zone: str
     roles: tuple[str, ...]
+    # Dedicated layout (docs/adr/0016): the node's group and its own machine type and data disk;
+    # None means the request's machine_type and storage_gb.
+    group: str | None = None
+    machine_type: str | None = None
+    storage_gb: int | None = None
 
 
 @dataclass
@@ -183,6 +188,8 @@ class InfrastructureRequest:
     # The registered network to run in; None for clusters created before networks existed,
     # which have a dedicated VPC (docs/adr/0013).
     network: NetworkRef | None = None
+    # An internal load balancer in front of these nodes (dedicated layout: the coordinating nodes).
+    load_balancer_nodes: list[str] = field(default_factory=list)
 
     def instance_name(self, node_name: str) -> str:
         return f"{self.resource_prefix}-{node_name}"

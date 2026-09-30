@@ -105,6 +105,7 @@ The backend suite also runs against PostgreSQL: `TEST_DATABASE_URL=postgresql+ps
 
 ## Documentation
 
+- [Requirements](docs/requirements/README.md): PRD v1, PRD v2 and TRD v2
 - [Architecture](docs/architecture.md): components, lifecycle and health, operations, security
 - [Architecture decision records](docs/adr/README.md): the decisions behind v2
 - [Migration plan](docs/migration-plan.md): v1 prototype → v2, what was kept, changed and removed

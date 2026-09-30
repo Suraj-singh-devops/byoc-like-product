@@ -184,6 +184,7 @@ class HealthService:
             high_availability=cluster.high_availability,
             thresholds=self.thresholds,
             now=utcnow(),
+            node_groups={n.name: n.node_group for n in nodes if n.node_group},
         )
         return db.health(ctx, observations)
 

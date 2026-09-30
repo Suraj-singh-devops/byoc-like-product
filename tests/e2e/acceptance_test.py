@@ -337,6 +337,110 @@ def main() -> int:
         f"create {create_op['status']}, delete {delete_op['status']}",
     )
 
+    print("\nHA topology (dedicated master, data, coordinating) and configuration")
+    ha_request = {
+        "name": f"e2e-ha-{suffix}",
+        "engine": "elasticsearch",
+        "version": "9.5.4",
+        "environment_id": environment["id"],
+        "network_id": network["id"],
+        "zone": "asia-south1-a",
+        "storage_type": "pd-balanced",
+        "high_availability": True,
+        "layout": "dedicated",
+        "node_groups": {
+            "master": {"count": 3, "machine_type": "e2-standard-4", "storage_gb": 20},
+            "data": {"count": 3, "machine_type": "e2-standard-8", "storage_gb": 200},
+            "coordinating": {"count": 2, "machine_type": "e2-standard-4", "storage_gb": 20},
+        },
+    }
+    status, ha_created = owner.api("POST", "/clusters", ha_request)
+    ha_op = wait_for_operation(owner, ha_created["operation_id"], timeout=300) if status == 202 else {"status": status}
+    _, ha = owner.api("GET", f"/clusters/{ha_created.get('cluster_id')}")
+    groups = {g["name"]: g["count"] for g in ha.get("node_groups", [])}
+    masters = [n for n in ha.get("nodes", []) if n["node_group"] == "master"]
+    check(
+        "HA-1",
+        "Dedicated layout: 3 masters (one per zone), 3 data, 2 coordinating nodes",
+        ha_op["status"] == "COMPLETED"
+        and ha.get("health") == "HEALTHY"
+        and groups == {"master": 3, "data": 3, "coordinating": 2}
+        and len({n["zone"] for n in masters}) == 3,
+        f"{ha_op['status']}; {groups}; {ha.get('health')}",
+    )
+    check("HA-2", "One private endpoint (internal load balancer)", bool(ha.get("endpoint")), str(ha.get("endpoint")))
+    status, ha_config = owner.api("GET", f"/clusters/{ha['id']}/config")
+    scopes = {s["scope"] for s in (ha_config or {}).get("settings", [])}
+    check("CFG-1", "Settings catalog lists live and restart settings", status == 200 and scopes == {"dynamic", "static"})
+    status, _ = operator.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"search.max_buckets": 30000}})
+    check("CFG-2", "Operators cannot change the configuration", status == 403, f"HTTP {status}")
+    status, _ = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"xpack.security.enabled": False}})
+    check("CFG-3", "Unmanaged settings are refused", status == 422, f"HTTP {status}")
+    status, live = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"search.max_buckets": 30000}})
+    live_op = wait_for_operation(owner, live["operation_id"], timeout=180) if status == 202 else {"status": status}
+    check(
+        "CFG-4",
+        "Live setting applied without restarting any node",
+        live_op["status"] == "COMPLETED" and live_op.get("result", {}).get("restarted") == [],
+        live_op["status"],
+    )
+    status, rolling = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"thread_pool.write.queue_size": 20000}})
+    rolling_op = wait_for_operation(owner, rolling["operation_id"], timeout=300) if status == 202 else {"status": status}
+    order = (rolling_op.get("result") or {}).get("restarted") or []
+    check(
+        "CFG-5",
+        "Static setting applied by a rolling restart, masters last",
+        rolling_op["status"] == "COMPLETED" and len(order) == 8 and all(n.startswith("master-") for n in order[-3:]),
+        " > ".join(order),
+    )
+    _, ha_config = owner.api("GET", f"/clusters/{ha['id']}/config")
+    _, ha = owner.api("GET", f"/clusters/{ha['id']}")
+    check(
+        "CFG-6",
+        "Desired and applied configuration match; cluster healthy",
+        ha_config["desired"] == ha_config["applied"] == {"search.max_buckets": 30000, "thread_pool.write.queue_size": 20000}
+        and ha["health"] == "HEALTHY",
+        json.dumps(ha_config["applied"]),
+    )
+    status, yml = owner.api(
+        "PUT", f"/clusters/{ha['id']}/config", {"settings": {"indices.query.bool.max_clause_count": 8192}}
+    )
+    yml_op = wait_for_operation(owner, yml["operation_id"], timeout=300) if status == 202 else {"status": status}
+    _, ha_config = owner.api("GET", f"/clusters/{ha['id']}/config")
+    data_file = next((f for f in ha_config["config_file"]["files"] if f["group"] == "data"), {"user": []})
+    check(
+        "YML-1",
+        "Any elasticsearch.yml setting, rolled out node by node",
+        yml_op["status"] == "COMPLETED" and 'indices.query.bool.max_clause_count: "8192"' in data_file["user"],
+        yml_op["status"],
+    )
+    status, _ = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"network.bind_host": "0.0.0.0"}})
+    check("YML-2", "Platform-owned elasticsearch.yml settings are refused", status == 422, f"HTTP {status}")
+    status, bad = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"unknown.setting": "1"}})
+    bad_op = wait_for_operation(owner, bad["operation_id"], timeout=300) if status == 202 else {"status": status}
+    _, ha = owner.api("GET", f"/clusters/{ha['id']}")
+    check(
+        "YML-3",
+        "A setting Elasticsearch refuses is rolled back on the first node; the cluster keeps serving",
+        bad_op.get("error_code") == "CONFIG_REJECTED" and ha["lifecycle"] == "ACTIVE" and ha["health"] == "HEALTHY",
+        f"{bad_op.get('error_code')}; {ha['lifecycle']}/{ha['health']}",
+    )
+    status, fixed = owner.api("PUT", f"/clusters/{ha['id']}/config", {"settings": {"unknown.setting": None}})
+    fixed_op = wait_for_operation(owner, fixed["operation_id"], timeout=300) if status == 202 else {"status": status}
+    check("YML-4", "Removing the refused setting completes", fixed_op["status"] == "COMPLETED", fixed_op["status"])
+    status, scaled = owner.api("POST", f"/clusters/{ha['id']}/scale", {"node_count": 3, "group": "coordinating"})
+    scale_op = wait_for_operation(owner, scaled["operation_id"], timeout=240) if status == 202 else {"status": status}
+    _, ha = owner.api("GET", f"/clusters/{ha['id']}")
+    check(
+        "HA-3",
+        "Scale the coordinating group only",
+        scale_op["status"] == "COMPLETED" and {g["name"]: g["count"] for g in ha["node_groups"]}["coordinating"] == 3,
+        scale_op["status"],
+    )
+    status, deletion = owner.api("DELETE", f"/clusters/{ha['id']}?confirm={ha_request['name']}")
+    ha_delete = wait_for_operation(owner, deletion["operation_id"], timeout=180) if status == 202 else {"status": status}
+    check("HA-4", "Delete the HA cluster", ha_delete["status"] == "COMPLETED", ha_delete["status"])
+
     print("\nAudit")
     _, audit = owner.api("GET", f"/audit-logs?resource_id={cluster_id}&limit=50")
     seen = {(e["action"], e["status"]) for e in audit["items"]}

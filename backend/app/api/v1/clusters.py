@@ -11,6 +11,7 @@ from app.api.v1.schemas import (
     ClusterDetail,
     ClusterScaleRequest,
     ClusterSummary,
+    ConfigUpdateRequest,
     EventOut,
     NodeOut,
     OperationAccepted,
@@ -39,6 +40,9 @@ def create_cluster(
     fields = body.model_dump(mode="python")
     for key in ("environment_id", "network_id", "cloud_account_id"):
         fields[key] = str(fields[key]) if fields[key] is not None else None
+    fields["machine_type"] = fields["machine_type"] or ""
+    fields["node_count"] = fields["node_count"] or 0
+    fields["storage_gb"] = fields["storage_gb"] or 0
     data = ClusterCreateInput(**fields)
     cluster, op = _service(session, platform, principal).create(data, idempotency_key)
     return OperationAccepted(cluster_id=cluster.id, operation_id=op.id, lifecycle=cluster.lifecycle_state)
@@ -106,7 +110,31 @@ def scale_cluster(
     session: Session = Depends(get_session),
     platform: Platform = Depends(get_platform),
 ) -> OperationAccepted:
-    cluster, op = _service(session, platform, principal).scale(cluster_id, body.node_count, idempotency_key)
+    cluster, op = _service(session, platform, principal).scale(cluster_id, body.node_count, idempotency_key, body.group)
+    return OperationAccepted(cluster_id=cluster.id, operation_id=op.id, lifecycle=cluster.lifecycle_state)
+
+
+@router.get("/{cluster_id}/config")
+def cluster_config(
+    cluster_id: str,
+    principal: Principal = Depends(get_principal),
+    session: Session = Depends(get_session),
+    platform: Platform = Depends(get_platform),
+) -> dict[str, Any]:
+    """The settings catalog, the desired overrides, what is applied, and what is still pending."""
+    return _service(session, platform, principal).config(cluster_id)
+
+
+@router.put("/{cluster_id}/config", response_model=OperationAccepted, status_code=202)
+def update_cluster_config(
+    cluster_id: str,
+    body: ConfigUpdateRequest,
+    idempotency_key: str | None = IdempotencyKey,
+    principal: Principal = Depends(get_principal),
+    session: Session = Depends(get_session),
+    platform: Platform = Depends(get_platform),
+) -> OperationAccepted:
+    cluster, op = _service(session, platform, principal).update_config(cluster_id, body.settings, idempotency_key)
     return OperationAccepted(cluster_id=cluster.id, operation_id=op.id, lifecycle=cluster.lifecycle_state)
 
 

@@ -340,6 +340,12 @@ class NetworkOut(BaseModel):
 # --------------------------------------------------------------------- clusters
 
 
+class NodeGroupRequest(Strict):
+    count: int = Field(ge=0, le=50)
+    machine_type: str = Field(max_length=63)
+    storage_gb: int = Field(default=20, ge=10, le=65536)
+
+
 class ClusterCreateRequest(Strict):
     name: str = Field(min_length=3, max_length=40)
     engine: str = "elasticsearch"
@@ -351,15 +357,41 @@ class ClusterCreateRequest(Strict):
     )
     cloud_account_id: uuid.UUID | None = Field(default=None, description="Optional; must be the network's.")
     region: str | None = Field(default=None, max_length=50, description="Optional; must be the network's.")
-    machine_type: str
-    node_count: int = Field(ge=1, le=50)
-    storage_gb: int = Field(ge=10, le=65536)
+    layout: Literal["combined", "dedicated"] = Field(
+        default="combined",
+        description="combined: every node has every role. dedicated: master, data and coordinating groups "
+        "(docs/adr/0016).",
+    )
+    # combined layout
+    machine_type: str | None = Field(default=None, max_length=63)
+    node_count: int | None = Field(default=None, ge=1, le=50)
+    storage_gb: int | None = Field(default=None, ge=10, le=65536)
+    # dedicated layout
+    node_groups: dict[str, NodeGroupRequest] | None = None
     storage_type: str = "pd-balanced"
     high_availability: bool = False
+    config: dict[str, Any] | None = Field(default=None, description="Initial setting overrides (docs/adr/0017).")
+
+    @model_validator(mode="after")
+    def _layout_fields(self) -> ClusterCreateRequest:
+        if self.layout == "combined":
+            missing = [f for f in ("machine_type", "node_count", "storage_gb") if getattr(self, f) is None]
+            if missing:
+                raise ValueError(f"The combined layout needs {', '.join(missing)}.")
+        elif not self.node_groups:
+            raise ValueError("The dedicated layout needs node_groups (master, data, coordinating).")
+        return self
 
 
 class ClusterScaleRequest(Strict):
-    node_count: int = Field(ge=1, le=50, description="Must be larger than the current node count.")
+    node_count: int = Field(ge=1, le=50, description="Must be larger than the current node count (of the group).")
+    group: str | None = Field(default=None, description="Dedicated layout: data or coordinating.")
+
+
+class ConfigUpdateRequest(Strict):
+    settings: dict[str, Any] = Field(
+        min_length=1, description="Setting => new value, or null to go back to the default (docs/adr/0017)."
+    )
 
 
 class OperationAccepted(BaseModel):
@@ -404,6 +436,9 @@ class ClusterSummary(BaseModel):
     region: str
     zone: str
     zones: list[str]
+    layout: str
+    node_groups: list[dict[str, Any]]
+    endpoint: str | None = Field(description="Internal load balancer address (dedicated layout).")
     machine_type: str
     node_count: int
     storage_gb: int
@@ -433,6 +468,17 @@ class ClusterSummary(BaseModel):
             "region": cluster.region,
             "zone": cluster.zone,
             "zones": list(desired.get("cloud", {}).get("zones") or [cluster.zone]),
+            "layout": desired.get("layout") or "combined",
+            "node_groups": [
+                {
+                    "name": g.get("name"),
+                    "count": g.get("count"),
+                    "machine_type": g.get("machineType"),
+                    "storage_gb": g.get("storageGB"),
+                }
+                for g in desired.get("nodeGroups") or []
+            ],
+            "endpoint": ((cluster.actual_state or {}).get("infrastructure") or {}).get("endpoint"),
             "machine_type": cluster.machine_type,
             "node_count": cluster.node_count,
             "storage_gb": cluster.storage_gb,
@@ -457,6 +503,8 @@ class NodeOut(BaseModel):
     name: str
     ordinal: int
     role: str
+    node_group: str | None
+    machine_type: str | None
     zone: str
     instance_name: str | None
     instance_id: str | None
@@ -489,6 +537,8 @@ class NodeOut(BaseModel):
             name=node.name,
             ordinal=node.ordinal,
             role=node.role,
+            node_group=node.node_group,
+            machine_type=node.machine_type,
             zone=node.zone,
             instance_name=node.instance_name,
             instance_id=node.instance_id,

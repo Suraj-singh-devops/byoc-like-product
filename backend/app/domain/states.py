@@ -20,6 +20,8 @@ class ClusterLifecycle(StrEnum):
     ACTIVE = "ACTIVE"
     SCALING = "SCALING"
     UPGRADING = "UPGRADING"  # reserved: upgrades are not part of the MVP
+    # Applying a configuration change (docs/adr/0017); like a scale, the cluster keeps serving.
+    UPDATING = "UPDATING"
     DELETING = "DELETING"
     FAILED = "FAILED"
     DELETED = "DELETED"
@@ -148,10 +150,12 @@ _C = ClusterLifecycle
 
 CLUSTER_TRANSITIONS: dict[ClusterLifecycle, frozenset[ClusterLifecycle]] = {
     _C.CREATING: frozenset({_C.ACTIVE, _C.FAILED, _C.DELETING}),
-    _C.ACTIVE: frozenset({_C.SCALING, _C.UPGRADING, _C.DELETING}),
+    _C.ACTIVE: frozenset({_C.SCALING, _C.UPGRADING, _C.UPDATING, _C.DELETING}),
     # A failed or cancelled scale-up returns to ACTIVE: the original nodes keep serving.
     _C.SCALING: frozenset({_C.ACTIVE, _C.DELETING}),
     _C.UPGRADING: frozenset({_C.ACTIVE, _C.FAILED, _C.DELETING}),
+    # A failed or cancelled configuration change returns to ACTIVE (a retry resumes it).
+    _C.UPDATING: frozenset({_C.ACTIVE, _C.DELETING}),
     # A failed cluster can be re-provisioned (retry of the create) or deleted.
     _C.FAILED: frozenset({_C.CREATING, _C.DELETING}),
     _C.DELETING: frozenset({_C.DELETED, _C.FAILED}),

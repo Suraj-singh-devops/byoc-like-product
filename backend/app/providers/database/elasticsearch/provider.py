@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from statistics import fmean
 from typing import Any
 
-from app.domain.cluster_spec import ClusterSpec
+from app.domain.cluster_spec import DEDICATED, ClusterSpec
 from app.domain.errors import ValidationFailed
 from app.domain.health import (
     HealthAssessment,
@@ -25,6 +26,7 @@ from app.providers.database.base import (
     MetricDefinition,
     ScalePlan,
 )
+from app.providers.database.elasticsearch import settings as es_settings
 from app.providers.database.elasticsearch import topology
 from app.providers.database.elasticsearch.versions import CatalogEntry, VersionCatalog, load_catalog
 
@@ -36,6 +38,45 @@ MAX_NODES = 30
 HA_MIN_NODES = 3
 HEAP_WARNING_PERCENT = 85
 HEAP_CRITICAL_PERCENT = 92
+# Dedicated layout (docs/adr/0016).
+MASTERS = 3
+HA_MIN_DATA = 2
+HA_MIN_COORDINATING = 2
+NODE_GROUPS = (
+    {
+        "name": "master",
+        "label": "Master nodes",
+        "min": MASTERS,
+        "max": MASTERS,
+        "ha_min": MASTERS,
+        "default_count": 3,
+        "default_storage_gb": 20,
+        "scalable": False,
+        "description": "Elect the master and hold the cluster state; one per zone.",
+    },
+    {
+        "name": "data",
+        "label": "Data nodes",
+        "min": 1,
+        "max": MAX_NODES,
+        "ha_min": HA_MIN_DATA,
+        "default_count": 3,
+        "default_storage_gb": 500,
+        "scalable": True,
+        "description": "Hold the shards; replicas are kept in another zone.",
+    },
+    {
+        "name": "coordinating",
+        "label": "Coordinating nodes",
+        "min": 0,
+        "max": 10,
+        "ha_min": HA_MIN_COORDINATING,
+        "default_count": 2,
+        "default_storage_gb": 20,
+        "scalable": True,
+        "description": "Take client requests behind the internal load balancer.",
+    },
+)
 
 METRICS = (
     MetricDefinition("jvm_heap_percent", "JVM heap", "percent"),
@@ -96,6 +137,8 @@ class ElasticsearchProvider(DatabaseProvider):
             default_machine_type="e2-standard-4",
             ports={"http": HTTP_PORT, "transport": TRANSPORT_PORT},
             metrics=METRICS,
+            node_groups=NODE_GROUPS,
+            settings=tuple(self.settings_catalog()),
         )
 
     # ----------------------------------------------------------------- versions
@@ -124,21 +167,28 @@ class ElasticsearchProvider(DatabaseProvider):
 
     # --------------------------------------------------------------- validation
 
-    def validate(self, spec: ClusterSpec, machine: MachineType | None = None) -> None:
+    def validate(
+        self,
+        spec: ClusterSpec,
+        machine: MachineType | None = None,
+        group_machines: dict[str, MachineType] | None = None,
+    ) -> None:
         problems: dict[str, str] = {}
         entry = self.versions.get(spec.version)
         if entry is None or not entry.installable:
             problems["version"] = f"Elasticsearch {spec.version} is not in the version catalog."
-        if spec.node_count > MAX_NODES:
+        if spec.layout == DEDICATED:
+            problems.update(self._validate_groups(spec, group_machines or {}))
+        elif spec.node_count > MAX_NODES:
             problems["node_count"] = f"Elasticsearch clusters are limited to {MAX_NODES} nodes."
-        if spec.high_availability and spec.node_count < HA_MIN_NODES:
+        if spec.layout != DEDICATED and spec.high_availability and spec.node_count < HA_MIN_NODES:
             problems["high_availability"] = (
                 f"High availability needs at least {HA_MIN_NODES} nodes so that the cluster keeps "
                 "a master quorum and replica shards when one node or zone fails."
             )
-        if spec.storage_gb < MIN_STORAGE_GB:
+        if spec.layout != DEDICATED and spec.storage_gb < MIN_STORAGE_GB:
             problems["storage_gb"] = f"Elasticsearch nodes need at least {MIN_STORAGE_GB} GB of storage."
-        if machine is not None and machine.memory_gb < MIN_MEMORY_GB:
+        if spec.layout != DEDICATED and machine is not None and machine.memory_gb < MIN_MEMORY_GB:
             problems["machine_type"] = (
                 f"{machine.name} has {machine.memory_gb:g} GB of memory; Elasticsearch needs at "
                 f"least {MIN_MEMORY_GB} GB (half is used for the JVM heap)."
@@ -150,11 +200,115 @@ class ElasticsearchProvider(DatabaseProvider):
                 suggested_action="Correct the highlighted fields and submit again.",
             )
 
+    @staticmethod
+    def _validate_groups(spec: ClusterSpec, machines: dict[str, MachineType]) -> dict[str, str]:
+        problems: dict[str, str] = {}
+        groups = {g.name: g for g in spec.node_groups}
+        for name in groups:
+            if name not in topology.GROUPS:
+                problems[f"node_groups.{name}"] = f"Unknown node group; use {', '.join(topology.GROUPS)}."
+        master, data = groups.get(topology.MASTER), groups.get(topology.DATA)
+        coordinating = groups.get(topology.COORDINATING)
+        if master is None or master.count != MASTERS:
+            problems["node_groups.master.count"] = (
+                f"A dedicated layout has exactly {MASTERS} master nodes, one per zone, so a quorum survives the "
+                "loss of any one."
+            )
+        if data is None or data.count < 1:
+            problems["node_groups.data.count"] = "At least one data node is needed."
+        elif spec.high_availability and data.count < HA_MIN_DATA:
+            problems["node_groups.data.count"] = (
+                f"High availability needs at least {HA_MIN_DATA} data nodes, so every shard has a copy in another zone."
+            )
+        if spec.high_availability and (coordinating is None or coordinating.count < HA_MIN_COORDINATING):
+            problems["node_groups.coordinating.count"] = (
+                f"High availability needs at least {HA_MIN_COORDINATING} coordinating nodes behind the load balancer."
+            )
+        if sum(g.count for g in groups.values()) > MAX_NODES:
+            problems["node_count"] = f"Elasticsearch clusters are limited to {MAX_NODES} nodes."
+        for name, group in groups.items():
+            if group.storage_gb < MIN_STORAGE_GB:
+                problems[f"node_groups.{name}.storage_gb"] = f"At least {MIN_STORAGE_GB} GB."
+            machine = machines.get(name)
+            if machine is not None and machine.memory_gb < MIN_MEMORY_GB:
+                problems[f"node_groups.{name}.machine_type"] = (
+                    f"{machine.name} has {machine.memory_gb:g} GB of memory; Elasticsearch needs at least "
+                    f"{MIN_MEMORY_GB} GB."
+                )
+        return problems
+
     # ------------------------------------------------------------ topology/config
 
     def provision(self, spec: ClusterSpec, zones: list[str]) -> EngineProvisionPlan:
-        nodes = topology.initial_topology(spec.node_count, zones)
+        if spec.layout == DEDICATED:
+            nodes = topology.dedicated_topology(spec.node_groups, zones)
+        else:
+            nodes = topology.initial_topology(spec.node_count, zones)
         return EngineProvisionPlan(nodes=nodes, settings=self.configure(spec, nodes, None))
+
+    def load_balancer_targets(self, spec: ClusterSpec, nodes: list[NodePlacement]) -> list[str]:
+        """Dedicated layout: the coordinating nodes, or the data nodes when there are none."""
+        if spec.layout != DEDICATED:
+            return []
+        for group in (topology.COORDINATING, topology.DATA):
+            names = sorted((n.name for n in nodes if n.group == group), key=lambda n: int(n.rsplit("-", 1)[1]))
+            if names:
+                return names
+        return []
+
+    # ---------------------------------------------------------- configuration
+
+    def settings_catalog(self) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in es_settings.CATALOG]
+
+    def merge_config(self, current: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+        return es_settings.merge_config(current, changes)
+
+    def config_plan(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        return {
+            "dynamic": [k for k in changed if es_settings.scope_of(k) == es_settings.DYNAMIC],
+            "static": [k for k in changed if es_settings.scope_of(k) == es_settings.STATIC],
+        }
+
+    def config_file(self, spec: ClusterSpec, config: dict[str, Any]) -> dict[str, Any]:
+        """elasticsearch.yml per node group: the lines the platform owns, then the user's settings."""
+        _, static = es_settings.split(config)
+        static.pop(es_settings.HEAP_PERCENT, None)
+        user = [f"{key}: {json.dumps(value)}" for key, value in sorted(static.items())]
+        if spec.layout == DEDICATED:
+            groups = [(g.name, list(topology.GROUP_ROLES[g.name])) for g in spec.node_groups]
+        else:
+            groups = [("all", ["master", "data", "ingest"])]
+        files = []
+        for name, roles in groups:
+            managed = [
+                f'cluster.name: "{spec.name}"',
+                'node.name: "<node name>"',
+                f"node.roles: {json.dumps(roles)}",
+                'node.attr.zone: "<zone>"',
+                "path.data: /var/lib/elasticsearch",
+                "path.logs: /var/log/elasticsearch",
+                'network.host: ["_local_", "<private IP>"]',
+                "http.port: 9200",
+                "transport.port: 9300",
+                "discovery.seed_hosts: [<master nodes>:9300]",
+            ]
+            if spec.high_availability:
+                managed.append("cluster.routing.allocation.awareness.attributes: zone")
+                if spec.layout == DEDICATED:
+                    managed.append("cluster.routing.allocation.awareness.force.zone.values: [<cluster zones>]")
+            managed += [
+                "xpack.security.enabled: true",
+                "xpack.security.transport.ssl.*: <cluster certificates>",
+                "xpack.security.http.ssl.*: <cluster certificates>",
+            ]
+            files.append({"group": name, "managed": managed, "user": user})
+        return {
+            "path": "/etc/elasticsearch/elasticsearch.yml",
+            "files": files,
+            "reserved_prefixes": list(es_settings.RESERVED_PREFIXES),
+        }
 
     def configure(
         self,
@@ -168,7 +322,19 @@ class ElasticsearchProvider(DatabaseProvider):
         # nodes added later must join the existing cluster, never bootstrap a new one.
         initial = (previous_settings or {}).get("initial_master_nodes") or masters
         zones = sorted({n.zone for n in nodes})
+        dynamic, static = es_settings.split(spec.config)
+        heap_percent = int(static.pop(es_settings.HEAP_PERCENT, es_settings.BY_KEY[es_settings.HEAP_PERCENT].default))
+        dedicated_ha = spec.layout == DEDICATED and spec.high_availability and len(zones) > 1
         return {
+            "layout": spec.layout,
+            # Live settings, applied by the agent on the elected master (docs/adr/0017).
+            "cluster_settings": dynamic,
+            "cluster_settings_hash": es_settings.settings_hash(dynamic),
+            # Node settings and heap, applied by a rolling restart.
+            "node_settings": static,
+            "heap_percent": heap_percent,
+            # Forced awareness: a zone outage never piles every copy onto the surviving zones.
+            "forced_awareness_zones": zones if dedicated_ha else [],
             "cluster_name": spec.name,
             "version": entry.version,
             "package": entry.package_settings(),
@@ -186,7 +352,10 @@ class ElasticsearchProvider(DatabaseProvider):
         target_count: int,
         zones: list[str],
         previous_settings: dict[str, Any] | None,
+        group: str | None = None,
     ) -> ScalePlan:
+        if spec.layout == DEDICATED:
+            return self._scale_group(spec, current_nodes, target_count, zones, previous_settings, group)
         current = len(current_nodes)
         if target_count < current:
             raise ValidationFailed(
@@ -219,6 +388,53 @@ class ElasticsearchProvider(DatabaseProvider):
             settings=self.configure(spec.with_node_count(target_count), remaining, previous_settings),
         )
 
+    def _scale_group(
+        self,
+        spec: ClusterSpec,
+        current_nodes: list[NodePlacement],
+        target_count: int,
+        zones: list[str],
+        previous_settings: dict[str, Any] | None,
+        group_name: str | None,
+    ) -> ScalePlan:
+        group = spec.group(group_name or "")
+        if group is None or group_name not in (topology.DATA, topology.COORDINATING):
+            raise ValidationFailed(
+                "Choose the data or the coordinating group to scale.",
+                reason=f"Master nodes stay at {MASTERS} so that the quorum never changes.",
+                details={"fields": {"group": "Must be data or coordinating."}},
+            )
+        current = sum(1 for n in current_nodes if n.group == group.name)
+        label = f"{group.name} node"
+        if target_count < current:
+            raise ValidationFailed(
+                f"Scaling down ({current} to {target_count} {group.name} nodes) is not supported.",
+                code="SCALE_DOWN_NOT_SUPPORTED",
+                reason="Removing nodes needs shard relocation that the platform does not perform yet.",
+                details={"fields": {"node_count": f"Must be more than {current}."}},
+            )
+        if target_count == current:
+            raise ValidationFailed(
+                f"The {group.name} group already has {plural(current, label)}.",
+                code="NO_CHANGE",
+                details={"fields": {"node_count": f"The group already has {current}."}},
+            )
+        if len(current_nodes) - current + target_count > MAX_NODES:
+            raise ValidationFailed(
+                "The scale request is invalid.",
+                details={"fields": {"node_count": f"Elasticsearch clusters are limited to {MAX_NODES} nodes."}},
+            )
+        add = topology.add_to_group(group, sorted(current_nodes, key=lambda n: n.ordinal), target_count, zones)
+        remaining = sorted(current_nodes, key=lambda n: n.ordinal) + add
+        target_spec = spec.with_group_count(group.name, target_count)
+        return ScalePlan(
+            current_count=current,
+            target_count=target_count,
+            add=add,
+            nodes=remaining,
+            settings=self.configure(target_spec, remaining, previous_settings),
+        )
+
     # ------------------------------------------------------------------- health
 
     def health(self, ctx: HealthContext, observations: list[NodeObservation]) -> HealthAssessment:
@@ -248,6 +464,8 @@ class ElasticsearchProvider(DatabaseProvider):
 
         expected = len(ctx.expected_nodes)
         infrastructure, reasons = rollup_infrastructure(nodes, expected)
+        groups = ctx.node_groups
+        data_nodes = sum(1 for g in groups.values() if g == topology.DATA) if groups else expected
         warnings: list[str] = [f"{n.name}: {w}" for n in nodes for w in n.warnings]
         engine_states: list[ClusterHealth] = []
         engine_status: str | None = None
@@ -265,7 +483,7 @@ class ElasticsearchProvider(DatabaseProvider):
                     "including primaries (some data is unavailable)"
                 )
             elif engine_status == "yellow":
-                if expected == 1:
+                if data_nodes == 1:
                     warnings.append("Single-node cluster: replica shards cannot be allocated (no redundancy)")
                 else:
                     engine_states.append(ClusterHealth.DEGRADED)
@@ -293,6 +511,8 @@ class ElasticsearchProvider(DatabaseProvider):
             if silent:
                 engine_states.append(ClusterHealth.DEGRADED)
                 reasons.append(f"No recent report from: {', '.join(silent)}")
+            if groups:
+                engine_states.extend(self._role_health(groups, nodes, reasons))
             engine = worst_cluster_health(engine_states) if engine_states else ClusterHealth.HEALTHY
         elif reporting:
             engine = ClusterHealth.UNHEALTHY
@@ -314,6 +534,24 @@ class ElasticsearchProvider(DatabaseProvider):
             engine_node_count=engine_nodes,
             checked_at=ctx.now,
         )
+
+    @staticmethod
+    def _role_health(groups: dict[str, str], nodes: list[NodeAssessment], reasons: list[str]) -> list[ClusterHealth]:
+        """Dedicated layout (docs/adr/0016): the master quorum and the coordinating tier."""
+        states: list[ClusterHealth] = []
+        down = {n.name for n in nodes if NodeHealth.UNHEALTHY in (n.infrastructure, n.engine)}
+        masters = [name for name, group in groups.items() if group == topology.MASTER]
+        masters_up = sum(1 for m in masters if m not in down)
+        if masters and masters_up * 2 <= len(masters):
+            states.append(ClusterHealth.UNHEALTHY)
+            reasons.append(
+                f"Master quorum lost: {masters_up} of {len(masters)} masters available (no writes, no cluster changes)"
+            )
+        coordinating = [name for name, group in groups.items() if group == topology.COORDINATING]
+        if coordinating and all(c in down for c in coordinating):
+            states.append(ClusterHealth.UNHEALTHY)
+            reasons.append("No coordinating node available: the cluster endpoint cannot serve requests")
+        return states
 
     # ------------------------------------------------------------------ metrics
 

@@ -15,6 +15,7 @@ import {
   PROVIDER_NAMES,
 } from "@/components/Badges";
 import { DeleteDialog, FaultDialog, ScaleDialog } from "@/components/ClusterDialogs";
+import { ConfigurationPanel } from "@/components/ConfigurationPanel";
 import { Icon } from "@/components/Icon";
 import { ProgressBar } from "@/components/Meter";
 import { MetricsPanel } from "@/components/MetricsPanel";
@@ -66,7 +67,13 @@ function NodesTable({ nodes, now }: { nodes: NodeInfo[]; now: number }) {
                   {node.engine_metrics.is_master ? <span className="pill" style={{ marginLeft: 6 }}>elected master</span> : null}
                   <div className="small muted">{node.instance_name}</div>
                 </td>
-                <td>{node.role.split(",").join(", ")}</td>
+                <td>
+                  {node.node_group ? <strong>{node.node_group}</strong> : null}
+                  <div className={node.node_group ? "small muted" : undefined}>
+                    {node.role ? node.role.split(",").join(", ") : "coordinating only"}
+                  </div>
+                  {node.node_group && node.machine_type ? <div className="small muted">{node.machine_type}</div> : null}
+                </td>
                 <td style={{ whiteSpace: "nowrap" }}>{node.zone}</td>
                 <td className="mono" style={{ whiteSpace: "nowrap" }}>{node.private_ip ?? "-"}</td>
                 <td>
@@ -141,7 +148,8 @@ export default function ClusterPage() {
 
   const op = c.active_operation;
   const deleted = c.lifecycle === "DELETED";
-  const serving = c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING";
+  const serving = c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING" || c.lifecycle === "UPDATING";
+  const dedicated = c.layout === "dedicated";
   const infra = c.actual_state.infrastructure ?? {};
   const actualNodes = c.actual_state.nodes?.count;
   const drift = c.generation !== c.observed_generation;
@@ -322,6 +330,10 @@ export default function ClusterPage() {
               <dd>{Array.from(new Set(c.nodes.map((n) => n.zone))).join(", ") || c.zone}</dd>
             </div>
             <div>
+              <dt>Topology</dt>
+              <dd>{dedicated ? "Dedicated master, data and coordinating nodes" : "Combined (every node has every role)"}</dd>
+            </div>
+            <div>
               <dt>Nodes</dt>
               <dd>
                 {actualNodes ?? c.nodes.length}
@@ -330,16 +342,31 @@ export default function ClusterPage() {
                 ) : null}
               </dd>
             </div>
-            <div>
-              <dt>Machine</dt>
-              <dd>{c.machine_type}</dd>
-            </div>
-            <div>
-              <dt>Storage</dt>
-              <dd>
-                {c.storage_gb} GB {c.storage_type} per node
-              </dd>
-            </div>
+            {dedicated ? (
+              <div className="kv-wide">
+                <dt>Node groups</dt>
+                <dd>
+                  {c.node_groups.map((g) => (
+                    <div key={g.name}>
+                      {g.count} {g.name} × {g.machine_type}, {g.storage_gb} GB {c.storage_type}
+                    </div>
+                  ))}
+                </dd>
+              </div>
+            ) : (
+              <>
+                <div>
+                  <dt>Machine</dt>
+                  <dd>{c.machine_type}</dd>
+                </div>
+                <div>
+                  <dt>Storage</dt>
+                  <dd>
+                    {c.storage_gb} GB {c.storage_type} per node
+                  </dd>
+                </div>
+              </>
+            )}
             <div>
               <dt>High availability</dt>
               <dd>{c.high_availability ? "Enabled (multi-zone)" : "Disabled"}</dd>
@@ -417,11 +444,25 @@ export default function ClusterPage() {
           description="Private endpoints: reachable from the network's subnets (other ranges need firewall rules you add)."
         >
           <div className="stack">
+            {c.endpoint ? (
+              <div className="stack" style={{ gap: 4 }}>
+                <div className="row" style={{ gap: 8 }}>
+                  <strong>Cluster endpoint</strong>
+                  <Copyable value={c.endpoint} />
+                </div>
+                <span className="small muted">
+                  Internal load balancer in front of the coordinating nodes; use this address in your applications.
+                </span>
+              </div>
+            ) : null}
             {infra.http_endpoints?.length ? (
-              <div className="row" style={{ gap: 12 }}>
-                {infra.http_endpoints.map((endpoint) => (
-                  <Copyable key={endpoint} value={endpoint} />
-                ))}
+              <div className="stack" style={{ gap: 4 }}>
+                {c.endpoint ? <span className="small muted">Direct node addresses (troubleshooting)</span> : null}
+                <div className="row" style={{ gap: 12 }}>
+                  {infra.http_endpoints.map((endpoint) => (
+                    <Copyable key={endpoint} value={endpoint} />
+                  ))}
+                </div>
               </div>
             ) : (
               <p className="muted">Endpoints appear once the VMs are provisioned.</p>
@@ -445,6 +486,21 @@ export default function ClusterPage() {
       ) : null}
 
       {serving ? <MetricsPanel clusterId={c.id} /> : null}
+
+      {!deleted && c.lifecycle !== "CREATING" ? (
+        <ConfigurationPanel
+          clusterId={c.id}
+          editable={can("cluster:configure")}
+          blockedReason={
+            op
+              ? "A change can be made once the running operation finishes."
+              : c.lifecycle !== "ACTIVE"
+                ? `The cluster is ${humanize(c.lifecycle).toLowerCase()}; configuration changes need an active cluster.`
+                : null
+          }
+          onStarted={(operationId) => router.push(`/operations/${operationId}`)}
+        />
+      ) : null}
 
       <Card title="Nodes" description={`${c.nodes.length} node${c.nodes.length === 1 ? "" : "s"}`} bodyless>
         <NodesTable nodes={c.nodes} now={now} />
@@ -514,7 +570,19 @@ export default function ClusterPage() {
                       "zone",
                     ]),
                   },
-                  ["cluster", "engine", "cloud", "compute", "storage", "nodes", "highAvailability", "generation"],
+                  [
+                    "cluster",
+                    "engine",
+                    "cloud",
+                    "layout",
+                    "nodeGroups",
+                    "compute",
+                    "storage",
+                    "nodes",
+                    "highAvailability",
+                    "config",
+                    "generation",
+                  ],
                 ),
                 null,
                 2,

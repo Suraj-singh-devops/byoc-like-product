@@ -18,10 +18,13 @@ import type {
   CloudAccount,
   CloudCatalog,
   CloudProviderName,
+  ClusterLayout,
   EngineCatalog,
   Environment,
   MachineType,
   Network,
+  NodeGroup,
+  NodeGroupName,
   OperationAccepted,
 } from "@/lib/types";
 
@@ -43,7 +46,11 @@ interface SpecState {
   storage_gb: number;
   storage_type: string;
   high_availability: boolean;
+  layout: ClusterLayout;
+  node_groups: Record<NodeGroupName, NodeGroup>;
 }
+
+const GROUP_ORDER: NodeGroupName[] = ["master", "data", "coordinating"];
 
 function Steps({ current, onJump }: { current: Step; onJump: (step: Step) => void }) {
   const index = STEPS.findIndex((s) => s.key === current);
@@ -372,7 +379,16 @@ function ConfigureStep({
     storage_gb: 100,
     storage_type: "",
     high_availability: production && haPossible,
+    // Production gets dedicated master, data and coordinating nodes (docs/adr/0016).
+    layout: production && haPossible && engine.node_groups.length ? "dedicated" : "combined",
+    node_groups: Object.fromEntries(
+      engine.node_groups.map((g) => [
+        g.name,
+        { name: g.name, count: g.default_count, machine_type: "", storage_gb: g.default_storage_gb },
+      ]),
+    ) as Record<NodeGroupName, NodeGroup>,
   });
+  const dedicated = form.layout === "dedicated";
   const [error, setError] = useState<unknown>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -387,6 +403,12 @@ function ConfigureStep({
           ...f,
           machine_type: f.machine_type || result.default_machine_type,
           storage_type: f.storage_type || result.storage_types[0]?.name || "",
+          node_groups: Object.fromEntries(
+            Object.entries(f.node_groups).map(([name, g]) => [
+              name,
+              { ...g, machine_type: g.machine_type || result.default_machine_type },
+            ]),
+          ) as Record<NodeGroupName, NodeGroup>,
         }));
       })
       .catch(setError);
@@ -413,8 +435,34 @@ function ConfigureStep({
     if (form.name && !/^[a-z][a-z0-9-]{1,38}[a-z0-9]$/.test(form.name)) {
       errors.name = "3-40 lowercase letters, digits and hyphens; start with a letter.";
     }
-    if (form.high_availability && form.node_count < engine.ha_min_nodes) {
+    if (!dedicated && form.high_availability && form.node_count < engine.ha_min_nodes) {
       errors.node_count = `High availability needs at least ${engine.ha_min_nodes} nodes.`;
+    }
+    if (dedicated) {
+      for (const def of engine.node_groups) {
+        const group = form.node_groups[def.name];
+        if (!group) continue;
+        const min = form.high_availability ? Math.max(def.min, def.ha_min) : def.min;
+        if (group.count < min || group.count > def.max) {
+          errors[`node_groups.${def.name}.count`] =
+            def.min === def.max
+              ? `Exactly ${def.min}.`
+              : `${min}-${def.max}${form.high_availability && def.ha_min > def.min ? " with high availability" : ""}.`;
+        }
+        if (group.storage_gb < engine.min_storage_gb) {
+          errors[`node_groups.${def.name}.storage_gb`] = `At least ${engine.min_storage_gb} GB.`;
+        }
+        const m = machines.find((x) => x.name === group.machine_type);
+        if (m && m.memory_gb < engine.min_memory_gb) {
+          errors[`node_groups.${def.name}.machine_type`] = `At least ${engine.min_memory_gb} GB of memory.`;
+        }
+      }
+      const archs = new Set(
+        Object.values(form.node_groups)
+          .map((g) => machines.find((m) => m.name === g.machine_type)?.architecture)
+          .filter(Boolean),
+      );
+      if (archs.size > 1) errors["node_groups.data.machine_type"] = "All groups must use the same CPU architecture.";
     }
     if (form.high_availability && !haPossible) {
       errors.high_availability = `This network has ${network.zones.length} zone(s); high availability needs 3.`;
@@ -424,9 +472,16 @@ function ConfigureStep({
       errors.machine_type = `${engine.display_name} needs at least ${engine.min_memory_gb} GB of memory.`;
     }
     return errors;
-  }, [form, engine, machine, haPossible, network.zones.length]);
+  }, [form, engine, machine, machines, dedicated, haPossible, network.zones.length]);
   const errorFor = (field: string) => clientErrors[field] ?? fieldErrors[field];
   const update = <K extends keyof SpecState>(key: K, value: SpecState[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const updateGroup = (name: NodeGroupName, patch: Partial<NodeGroup>) =>
+    setForm((f) => ({ ...f, node_groups: { ...f.node_groups, [name]: { ...f.node_groups[name], ...patch } } }));
+  const groups = GROUP_ORDER.map((name) => form.node_groups[name]).filter(Boolean);
+  const totalNodes = dedicated ? groups.reduce((sum, g) => sum + g.count, 0) : form.node_count;
+  const totalStorage = dedicated
+    ? groups.reduce((sum, g) => sum + g.count * g.storage_gb, 0)
+    : form.node_count * form.storage_gb;
   const haZones = form.high_availability
     ? [form.zone, ...network.zones.filter((z) => z !== form.zone).sort()].slice(0, 3)
     : [form.zone];
@@ -440,7 +495,35 @@ function ConfigureStep({
       const result = await api<OperationAccepted>("/clusters", {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey.current },
-        body: { ...form, environment_id: environment.id, network_id: network.id },
+        body: dedicated
+          ? {
+              name: form.name,
+              engine: form.engine,
+              version: form.version,
+              zone: form.zone,
+              storage_type: form.storage_type,
+              high_availability: form.high_availability,
+              layout: "dedicated",
+              node_groups: Object.fromEntries(
+                groups.map((g) => [g.name, { count: g.count, machine_type: g.machine_type, storage_gb: g.storage_gb }]),
+              ),
+              environment_id: environment.id,
+              network_id: network.id,
+            }
+          : {
+              name: form.name,
+              engine: form.engine,
+              version: form.version,
+              zone: form.zone,
+              machine_type: form.machine_type,
+              node_count: form.node_count,
+              storage_gb: form.storage_gb,
+              storage_type: form.storage_type,
+              high_availability: form.high_availability,
+              layout: "combined",
+              environment_id: environment.id,
+              network_id: network.id,
+            },
       });
       onCreated(result);
     } catch (err) {
@@ -501,6 +584,43 @@ function ConfigureStep({
           </div>
         </Card>
 
+        <Card title="Topology">
+          <div className="choice-grid" role="radiogroup" aria-label="Topology">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={dedicated}
+              className="choice"
+              data-selected={dedicated || undefined}
+              disabled={!engine.node_groups.length}
+              onClick={() => update("layout", "dedicated")}
+            >
+              <Icon name="layers" size={18} />
+              <span>
+                <strong>Dedicated roles{production ? " (recommended)" : ""}</strong>
+                <span className="muted small">
+                  3 master nodes, data nodes and coordinating nodes behind one internal load balancer. A busy data node
+                  never slows down master elections.
+                </span>
+              </span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={!dedicated}
+              className="choice"
+              data-selected={!dedicated || undefined}
+              onClick={() => update("layout", "combined")}
+            >
+              <Icon name="server" size={18} />
+              <span>
+                <strong>Combined</strong>
+                <span className="muted small">Every node is master-eligible, holds data and takes requests. Fewer VMs.</span>
+              </span>
+            </button>
+          </div>
+        </Card>
+
         <Card title="Resources">
           <div className="form">
             <div className="field-row">
@@ -518,50 +638,129 @@ function ConfigureStep({
                   ))}
                 </select>
               </Field>
-              <Field label="Machine type" htmlFor="machine" error={errorFor("machine_type")}>
-                <select
-                  id="machine"
-                  className="select"
-                  value={form.machine_type}
-                  onChange={(e) => update("machine_type", e.target.value)}
-                >
-                  {form.machine_type && !machines.some((m) => m.name === form.machine_type) ? (
-                    <option value={form.machine_type}>{form.machine_type}</option>
-                  ) : null}
-                  {machines.map((m) => (
-                    <option key={m.name} value={m.name}>
-                      {m.name} · {m.vcpus} vCPU · {m.memory_gb} GB{m.architecture === "arm64" ? " · Arm" : ""}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {!dedicated ? (
+                <Field label="Machine type" htmlFor="machine" error={errorFor("machine_type")}>
+                  <select
+                    id="machine"
+                    className="select"
+                    value={form.machine_type}
+                    onChange={(e) => update("machine_type", e.target.value)}
+                  >
+                    {form.machine_type && !machines.some((m) => m.name === form.machine_type) ? (
+                      <option value={form.machine_type}>{form.machine_type}</option>
+                    ) : null}
+                    {machines.map((m) => (
+                      <option key={m.name} value={m.name}>
+                        {m.name} · {m.vcpus} vCPU · {m.memory_gb} GB{m.architecture === "arm64" ? " · Arm" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : null}
             </div>
+            {dedicated ? (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Group</th>
+                      <th>Nodes</th>
+                      <th>Machine type</th>
+                      <th>Disk (GB)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {engine.node_groups.map((def) => {
+                      const group = form.node_groups[def.name];
+                      if (!group) return null;
+                      const err = (f: string) => errorFor(`node_groups.${def.name}.${f}`);
+                      return (
+                        <tr key={def.name}>
+                          <td>
+                            <strong>{def.label}</strong>
+                            <div className="small muted">{def.description}</div>
+                          </td>
+                          <td>
+                            <input
+                              className="input"
+                              type="number"
+                              aria-label={`${def.label}: nodes`}
+                              min={def.min}
+                              max={def.max}
+                              value={group.count}
+                              disabled={def.min === def.max}
+                              onChange={(e) => updateGroup(def.name, { count: Number(e.target.value) })}
+                              aria-invalid={Boolean(err("count"))}
+                              style={{ width: 80 }}
+                            />
+                            {err("count") ? <div className="error-text">{err("count")}</div> : null}
+                          </td>
+                          <td>
+                            <select
+                              className="select"
+                              aria-label={`${def.label}: machine type`}
+                              value={group.machine_type}
+                              onChange={(e) => updateGroup(def.name, { machine_type: e.target.value })}
+                            >
+                              {group.machine_type && !machines.some((m) => m.name === group.machine_type) ? (
+                                <option value={group.machine_type}>{group.machine_type}</option>
+                              ) : null}
+                              {machines.map((m) => (
+                                <option key={m.name} value={m.name}>
+                                  {m.name} · {m.vcpus} vCPU · {m.memory_gb} GB{m.architecture === "arm64" ? " · Arm" : ""}
+                                </option>
+                              ))}
+                            </select>
+                            {err("machine_type") ? <div className="error-text">{err("machine_type")}</div> : null}
+                          </td>
+                          <td>
+                            <input
+                              className="input"
+                              type="number"
+                              aria-label={`${def.label}: disk size`}
+                              min={engine.min_storage_gb}
+                              max={engine.max_storage_gb}
+                              value={group.storage_gb}
+                              onChange={(e) => updateGroup(def.name, { storage_gb: Number(e.target.value) })}
+                              aria-invalid={Boolean(err("storage_gb"))}
+                              style={{ width: 100 }}
+                            />
+                            {err("storage_gb") ? <div className="error-text">{err("storage_gb")}</div> : null}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
             <div className="field-row">
-              <Field label="Nodes" htmlFor="nodes" error={errorFor("node_count")}>
-                <input
-                  id="nodes"
-                  className="input"
-                  type="number"
-                  min={engine.min_nodes}
-                  max={engine.max_nodes}
-                  value={form.node_count}
-                  onChange={(e) => update("node_count", Number(e.target.value))}
-                  aria-invalid={Boolean(errorFor("node_count"))}
-                />
-              </Field>
-              <Field label="Storage per node (GB)" htmlFor="storage" error={errorFor("storage_gb")}>
-                <input
-                  id="storage"
-                  className="input"
-                  type="number"
-                  min={engine.min_storage_gb}
-                  max={engine.max_storage_gb}
-                  value={form.storage_gb}
-                  onChange={(e) => update("storage_gb", Number(e.target.value))}
-                  aria-invalid={Boolean(errorFor("storage_gb"))}
-                />
-              </Field>
-            </div>
+                <Field label="Nodes" htmlFor="nodes" error={errorFor("node_count")}>
+                  <input
+                    id="nodes"
+                    className="input"
+                    type="number"
+                    min={engine.min_nodes}
+                    max={engine.max_nodes}
+                    value={form.node_count}
+                    onChange={(e) => update("node_count", Number(e.target.value))}
+                    aria-invalid={Boolean(errorFor("node_count"))}
+                  />
+                </Field>
+                <Field label="Storage per node (GB)" htmlFor="storage" error={errorFor("storage_gb")}>
+                  <input
+                    id="storage"
+                    className="input"
+                    type="number"
+                    min={engine.min_storage_gb}
+                    max={engine.max_storage_gb}
+                    value={form.storage_gb}
+                    onChange={(e) => update("storage_gb", Number(e.target.value))}
+                    aria-invalid={Boolean(errorFor("storage_gb"))}
+                  />
+                </Field>
+              </div>
+            )}
             <Field label="Storage type" htmlFor="storage-type" error={errorFor("storage_type")}>
               <select
                 id="storage-type"
@@ -582,14 +781,17 @@ function ConfigureStep({
                 checked={form.high_availability}
                 onChange={(e) => {
                   update("high_availability", e.target.checked);
-                  if (e.target.checked && form.node_count < engine.ha_min_nodes) update("node_count", engine.ha_min_nodes);
+                  if (e.target.checked && !dedicated && form.node_count < engine.ha_min_nodes) {
+                    update("node_count", engine.ha_min_nodes);
+                  }
                 }}
               />
               <span>
                 <strong>High availability</strong>
                 <span className="hint" style={{ display: "block" }}>
-                  {engine.ha_min_nodes} master-eligible nodes in three zones; replica shards stay in a different zone from
-                  their primary.
+                  {dedicated
+                    ? "One master per zone, data and coordinating nodes spread over three zones; replica shards stay in a different zone from their primary, and a lost zone never piles its replicas onto the others."
+                    : `${engine.ha_min_nodes} master-eligible nodes in three zones; replica shards stay in a different zone from their primary.`}
                   {!haPossible ? " This network has fewer than three zones." : ""}
                 </span>
                 {errorFor("high_availability") ? <span className="error-text">{errorFor("high_availability")}</span> : null}
@@ -638,17 +840,34 @@ function ConfigureStep({
             </div>
             <div>
               <dt>Nodes</dt>
-              <dd>
-                {form.node_count} × {form.machine_type}
-                {machine ? ` (${machine.vcpus} vCPU, ${machine.memory_gb} GB)` : ""}
-              </dd>
+              {dedicated ? (
+                <dd>
+                  {groups.map((g) => (
+                    <div key={g.name}>
+                      {g.count} {g.name} × {g.machine_type}, {g.storage_gb} GB
+                    </div>
+                  ))}
+                  <div className="muted small">{totalNodes} VMs</div>
+                </dd>
+              ) : (
+                <dd>
+                  {form.node_count} × {form.machine_type}
+                  {machine ? ` (${machine.vcpus} vCPU, ${machine.memory_gb} GB)` : ""}
+                </dd>
+              )}
             </div>
             <div>
               <dt>Storage</dt>
               <dd>
-                {form.storage_gb} GB {form.storage_type} per node · {form.storage_gb * form.node_count} GB total
+                {form.storage_type} · {totalStorage} GB total
               </dd>
             </div>
+            {dedicated ? (
+              <div>
+                <dt>Endpoint</dt>
+                <dd>One private IP (internal load balancer, port 9200) in front of the coordinating nodes</dd>
+              </div>
+            ) : null}
           </dl>
           <p className="small muted">
             Runs in your subnet with no public IPs; only the cluster&apos;s own firewall rules are added. TLS between nodes
@@ -657,7 +876,12 @@ function ConfigureStep({
           <button
             className="button button-primary"
             type="submit"
-            disabled={submitting || !form.name || !form.machine_type || Object.keys(clientErrors).length > 0}
+            disabled={
+              submitting ||
+              !form.name ||
+              (dedicated ? groups.some((g) => !g.machine_type) : !form.machine_type) ||
+              Object.keys(clientErrors).length > 0
+            }
           >
             {submitting ? "Creating..." : "Create cluster"}
           </button>

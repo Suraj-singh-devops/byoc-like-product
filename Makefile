@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test test-backend test-backend-postgres test-agent test-terraform test-platform test-helm test-frontend lint agent smoke clean
+.PHONY: up down logs ps test test-backend test-backend-postgres test-agent test-terraform test-platform test-helm test-scripts test-frontend lint agent smoke clean
 
 up: ## Build and start the local control plane (mock mode) on http://localhost:3000
 	docker compose up --build -d
@@ -12,7 +12,7 @@ logs:
 ps:
 	docker compose ps
 
-test: test-backend test-agent test-terraform test-platform test-helm test-frontend ## Run every test suite
+test: test-backend test-agent test-terraform test-platform test-helm test-scripts test-frontend ## Run every test suite
 
 test-backend: ## Unit, API, provider and integration tests (SQLite)
 	cd backend && uv run pytest
@@ -25,6 +25,12 @@ test-agent: ## Go agent tests with the race detector (in Docker)
 
 test-terraform: ## Terraform validation and plan tests with mocked providers
 	cd infrastructure/terraform/gcp/modules/elasticsearch && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test
+
+test-scripts: ## VM scripts: shellcheck, and apply-config (render, restart, rollback) with stand-ins
+	docker run --rm -v "$(CURDIR)/infrastructure/terraform/gcp/modules/elasticsearch/scripts":/mnt:ro koalaman/shellcheck:stable \
+	  /mnt/startup.sh /mnt/apply-config.sh /mnt/tests/apply-config.test.sh
+	docker run --rm -v "$(CURDIR)/infrastructure/terraform/gcp/modules/elasticsearch/scripts":/scripts:ro alpine:3.22 \
+	  sh -c 'apk add -q bash jq coreutils grep sed diffutils >/dev/null && bash /scripts/tests/apply-config.test.sh'
 
 test-platform: ## GKE platform Terraform: validate + plan tests with mocked providers
 	cd infrastructure/terraform/platform && terraform init -backend=false -input=false >/dev/null && terraform validate && terraform test

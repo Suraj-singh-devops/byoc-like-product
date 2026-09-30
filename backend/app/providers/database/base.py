@@ -55,6 +55,10 @@ class EngineCatalog:
     default_machine_type: str
     ports: dict[str, int]
     metrics: tuple[MetricDefinition, ...]
+    # Dedicated layout groups: name, label, count limits and defaults (docs/adr/0016).
+    node_groups: tuple[dict[str, Any], ...] = ()
+    # Settings users may change (docs/adr/0017).
+    settings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,6 +112,8 @@ class HealthContext:
     high_availability: bool
     thresholds: HealthThresholds
     now: datetime
+    # node name => group (dedicated layout, docs/adr/0016); empty for the combined layout.
+    node_groups: dict[str, str] = field(default_factory=dict)
 
 
 class DatabaseProvider(ABC):
@@ -124,8 +130,16 @@ class DatabaseProvider(ABC):
         otherwise a supported catalog version. Raises ValidationFailed for anything else."""
 
     @abstractmethod
-    def validate(self, spec: ClusterSpec, machine: MachineType | None = None) -> None:
-        """Engine rules for a cluster spec; raise ValidationFailed with field details."""
+    def validate(
+        self,
+        spec: ClusterSpec,
+        machine: MachineType | None = None,
+        group_machines: dict[str, MachineType] | None = None,
+    ) -> None:
+        """Engine rules for a cluster spec; raise ValidationFailed with field details.
+
+        ``machine`` is the machine type of a combined layout; ``group_machines`` those of a
+        dedicated layout's groups."""
 
     @abstractmethod
     def provision(self, spec: ClusterSpec, zones: list[str]) -> EngineProvisionPlan:
@@ -154,8 +168,29 @@ class DatabaseProvider(ABC):
         target_count: int,
         zones: list[str],
         previous_settings: dict[str, Any] | None,
+        group: str | None = None,
     ) -> ScalePlan:
-        """Plan adding nodes. Raises ValidationFailed for fewer or equal nodes."""
+        """Plan adding nodes (to ``group`` in a dedicated layout). Raises ValidationFailed for fewer
+        or equal nodes."""
+
+    def load_balancer_targets(self, spec: ClusterSpec, nodes: list[NodePlacement]) -> list[str]:
+        """Nodes behind the cluster's internal load balancer; none by default."""
+        return []
+
+    def settings_catalog(self) -> list[dict[str, Any]]:
+        """Settings users may change (docs/adr/0017); none by default."""
+        return []
+
+    def merge_config(self, current: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+        raise NotSupported(f"{self.display_name} configuration cannot be changed from the platform.")
+
+    def config_plan(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        """What applying ``after`` over ``before`` involves: {"dynamic": [...], "static": [...]}."""
+        return {"dynamic": [], "static": []}
+
+    def config_file(self, spec: ClusterSpec, config: dict[str, Any]) -> dict[str, Any] | None:
+        """The engine's configuration file as the platform renders it (docs/adr/0018), or None."""
+        return None
 
     def engine_version_of(self, report_engine: dict[str, Any]) -> str | None:
         version = report_engine.get("version")

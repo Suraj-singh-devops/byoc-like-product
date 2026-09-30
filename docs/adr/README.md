@@ -21,5 +21,8 @@ supersedes the old one; do not rewrite accepted records.
 | [0013](0013-environments-and-registered-networks.md) | Environments and registered networks (existing VPC and subnet) | Accepted (P1b) |
 | [0014](0014-aws-support.md) | AWS support, mock first, with keyless per-organization access | Accepted (P1b mock; real AWS in the AWS track) |
 | [0015](0015-development-local-credentials.md) | Development-only real GCP with the developer's own credentials, allowlisted sandbox projects | Accepted (temporary, until P4) |
+| [0016](0016-ha-topology-dedicated-roles.md) | HA topology with dedicated master, data and coordinating nodes; internal load balancer | Accepted (supersedes part of 0011) |
+| [0017](0017-configuration-management.md) | Allowlisted configuration changes: dynamic live, static by rolling restart | Accepted (static allowlist superseded by 0018) |
+| [0018](0018-elasticsearch-yml-settings.md) | Any elasticsearch.yml setting except platform-owned ones; rollback of a node that does not start | Accepted |
 
 Related documents: [migration plan](../migration-plan.md), [implementation plan](../implementation-plan.md).

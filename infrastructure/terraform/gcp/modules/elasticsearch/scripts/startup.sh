@@ -53,17 +53,12 @@ retry() {
 
 # ------------------------------------------------------------------ configuration
 NODE_NAME=$(attr byoc-node-name)
-NODE_ROLES=$(attr byoc-node-roles "master,data,ingest")
 CLUSTER_ID=$(attr byoc-cluster-id)
-CLUSTER_NAME=$(attr byoc-cluster-name)
 ES_VERSION=$(attr byoc-es-version)
 ES_APT_REPOSITORY=$(attr byoc-es-apt-repository)
 ES_SIGNING_KEY_URL=$(attr byoc-es-signing-key-url)
 ES_SIGNING_KEY_FINGERPRINT=$(attr byoc-es-signing-key-fingerprint)
 ES_PACKAGE_SHA256=$(attr byoc-es-package-sha256)
-SEED_HOSTS=$(attr byoc-seed-hosts)
-INITIAL_MASTERS=$(attr byoc-initial-masters)
-ZONE_AWARENESS=$(attr byoc-zone-awareness false)
 SECRET_PREFIX=$(attr byoc-secret-prefix)
 BUCKET=$(attr byoc-artifacts-bucket)
 AGENT_OBJECT=$(attr byoc-agent-object)
@@ -71,12 +66,9 @@ AGENT_SHA256=$(attr byoc-agent-sha256)
 AGENT_VERSION=$(attr byoc-agent-version)
 CONTROL_PLANE_URL=$(attr byoc-control-plane-url)
 AGENT_AUDIENCE=$(attr byoc-agent-audience byoc-control-plane)
-ZONE=$(md instance/zone)
-ZONE=${ZONE##*/}
-IP=$(md instance/network-interfaces/0/ip)
 
-for required in NODE_NAME CLUSTER_ID CLUSTER_NAME ES_VERSION ES_APT_REPOSITORY ES_SIGNING_KEY_URL \
-  ES_SIGNING_KEY_FINGERPRINT ES_PACKAGE_SHA256 SEED_HOSTS SECRET_PREFIX; do
+for required in NODE_NAME CLUSTER_ID ES_VERSION ES_APT_REPOSITORY ES_SIGNING_KEY_URL \
+  ES_SIGNING_KEY_FINGERPRINT ES_PACKAGE_SHA256 SECRET_PREFIX; do
   if [ -z "${!required}" ]; then
     report failed "Instance metadata is missing ${required}"
     exit 1
@@ -174,60 +166,20 @@ ELASTIC_PASSWORD=$(retry 12 secret elastic-password)
 
 # ---------------------------------------------------------------------- configure
 step configuring "writing elasticsearch.yml, the keystore and JVM options"
-yaml_list() {
-  local out="" item
-  IFS=',' read -ra items <<<"$1"
-  for item in "${items[@]}"; do
-    [ -n "$item" ] && out+="\"${item}\", "
-  done
-  printf '[%s]' "${out%, }"
-}
+# The node configuration is rendered by apply-config, which the agent also runs (with
+# --restart) when the platform changes this node's configuration generation.
+install -d -m 0755 /opt/byoc/bin
+APPLY_CONFIG_TMP=$(mktemp)
+attr byoc-apply-config >"$APPLY_CONFIG_TMP"
+if [ ! -s "$APPLY_CONFIG_TMP" ]; then
+  report failed "Instance metadata is missing byoc-apply-config"
+  exit 1
+fi
+install -m 0755 -o root -g root "$APPLY_CONFIG_TMP" /opt/byoc/bin/apply-config
+rm -f "$APPLY_CONFIG_TMP"
 FORMED=/var/lib/byoc/cluster-formed
 mkdir -p /var/lib/byoc
-{
-  echo "# Managed by the BYOC platform; rewritten at every boot."
-  echo "cluster.name: \"${CLUSTER_NAME}\""
-  echo "node.name: \"${NODE_NAME}\""
-  echo "node.roles: $(yaml_list "$NODE_ROLES")"
-  echo "node.attr.zone: \"${ZONE}\""
-  echo "path.data: /var/lib/elasticsearch"
-  echo "path.logs: /var/log/elasticsearch"
-  echo "network.host: [\"_local_\", \"${IP}\"]"
-  echo "network.publish_host: \"${IP}\""
-  echo "http.port: 9200"
-  echo "transport.port: 9300"
-  echo "discovery.seed_hosts: $(yaml_list "$SEED_HOSTS")"
-  # Only the original master nodes bootstrap the cluster, and only before it first forms.
-  # Nodes added later must join the existing cluster, never start a new one.
-  if [ ! -f "$FORMED" ] && [[ ",${INITIAL_MASTERS}," == *",${NODE_NAME},"* ]]; then
-    echo "cluster.initial_master_nodes: $(yaml_list "$INITIAL_MASTERS")"
-  fi
-  if [ "$ZONE_AWARENESS" = "true" ]; then
-    echo "cluster.routing.allocation.awareness.attributes: zone"
-  fi
-  cat <<'EOF'
-xpack.security.enabled: true
-xpack.security.enrollment.enabled: false
-xpack.security.transport.ssl.enabled: true
-xpack.security.transport.ssl.verification_mode: certificate
-xpack.security.transport.ssl.key: certs/byoc/node.key
-xpack.security.transport.ssl.certificate: certs/byoc/node.crt
-xpack.security.transport.ssl.certificate_authorities: ["certs/byoc/ca.crt"]
-xpack.security.http.ssl.enabled: true
-xpack.security.http.ssl.key: certs/byoc/node.key
-xpack.security.http.ssl.certificate: certs/byoc/node.crt
-xpack.security.http.ssl.certificate_authorities: ["certs/byoc/ca.crt"]
-EOF
-} >/etc/elasticsearch/elasticsearch.yml
-chown root:elasticsearch /etc/elasticsearch/elasticsearch.yml
-chmod 0660 /etc/elasticsearch/elasticsearch.yml
-
-MEM_MB=$(($(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024))
-HEAP_MB=$((MEM_MB / 2))
-if ((HEAP_MB > 31744)); then
-  HEAP_MB=31744
-fi
-printf -- '-Xms%sm\n-Xmx%sm\n' "$HEAP_MB" "$HEAP_MB" >/etc/elasticsearch/jvm.options.d/byoc-heap.options
+/opt/byoc/bin/apply-config
 
 # Replace the package's security auto-configuration with the cluster's own certificates.
 KEYSTORE=/etc/elasticsearch/elasticsearch.keystore
@@ -265,7 +217,9 @@ if [ "$joined" != true ]; then
   exit 1
 fi
 touch "$FORMED"
-sed -i '/^cluster.initial_master_nodes:/d' /etc/elasticsearch/elasticsearch.yml
+# Re-render without cluster.initial_master_nodes (the cluster has formed) and record the
+# configuration generation this node runs.
+/opt/byoc/bin/apply-config --record
 
 # -------------------------------------------------------------------------- agent
 if [ -n "$AGENT_OBJECT" ]; then
@@ -295,6 +249,7 @@ if [ -n "$AGENT_OBJECT" ]; then
       elasticsearch_ca_file: "/etc/elasticsearch/certs/byoc/ca.crt",
       data_path: "/var/lib/elasticsearch",
       guest_attributes: true,
+      config_sync: true,
       interval_seconds: 30,
       state_dir: "/var/lib/byoc-agent"
     }' >/etc/byoc/agent.json

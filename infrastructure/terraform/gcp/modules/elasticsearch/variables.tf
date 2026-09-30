@@ -22,12 +22,27 @@ variable "region" {
 }
 
 variable "nodes" {
-  description = "Node name => placement. Names are node-1..node-N; the first three are master-eligible."
+  description = <<-EOT
+    Node name => placement. Combined layout: node-1..node-N, the first three master-eligible.
+    Dedicated layout (docs/adr/0016): master-N, data-N and coord-N, with their own machine type and
+    disk size; coordinating nodes have no roles. config_generation changes one node at a time
+    during a rolling restart (docs/adr/0017).
+  EOT
   type = map(object({
-    zone    = string
-    ordinal = number
-    roles   = list(string)
+    zone              = string
+    ordinal           = number
+    roles             = list(string)
+    machine_type      = optional(string)
+    data_disk_size_gb = optional(number)
+    config_generation = optional(number, 0)
   }))
+
+  validation {
+    condition = alltrue([
+      for node in values(var.nodes) : alltrue([for role in node.roles : contains(["master", "data", "ingest"], role)])
+    ])
+    error_message = "Node roles are master, data and ingest; an empty list is a coordinating-only node."
+  }
 
   validation {
     condition     = length(var.nodes) >= 1
@@ -194,4 +209,117 @@ variable "agent_audience" {
   description = "Audience of the VM identity token the agent presents when registering."
   type        = string
   default     = "byoc-control-plane"
+}
+
+# ------------------------------------------------------------ topology and configuration
+
+variable "layout" {
+  description = "combined (every node has every role) or dedicated (master, data, coordinating groups)."
+  type        = string
+  default     = "combined"
+
+  validation {
+    condition     = contains(["combined", "dedicated"], var.layout)
+    error_message = "layout must be combined or dedicated."
+  }
+}
+
+variable "forced_awareness_zones" {
+  description = "Zones for forced allocation awareness: replicas never pile up in the zones that are left when one fails."
+  type        = list(string)
+  default     = []
+}
+
+variable "load_balancer_nodes" {
+  description = "Nodes behind the internal TCP load balancer on 9200 (the coordinating nodes); empty for none."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for name in var.load_balancer_nodes : contains(keys(var.nodes), name)])
+    error_message = "load_balancer_nodes must name nodes of this cluster."
+  }
+}
+
+variable "cluster_settings" {
+  description = "Allowlisted dynamic settings the agent applies live on the elected master (docs/adr/0017)."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([for key in keys(var.cluster_settings) : contains([
+      "cluster.routing.allocation.disk.watermark.low",
+      "cluster.routing.allocation.disk.watermark.high",
+      "cluster.routing.allocation.disk.watermark.flood_stage",
+      "cluster.routing.allocation.enable",
+      "cluster.routing.rebalance.enable",
+      "cluster.routing.allocation.cluster_concurrent_rebalance",
+      "cluster.routing.allocation.node_concurrent_recoveries",
+      "indices.recovery.max_bytes_per_sec",
+      "cluster.max_shards_per_node",
+      "action.destructive_requires_name",
+      "search.max_buckets",
+      "indices.breaker.total.limit",
+    ], key)])
+    error_message = "cluster_settings may only contain the platform's allowlisted dynamic settings."
+  }
+
+  validation {
+    condition     = alltrue([for value in values(var.cluster_settings) : can(regex("^[0-9a-z%._]{1,16}$", value))])
+    error_message = "cluster_settings values must be plain numbers, sizes, percentages or keywords."
+  }
+}
+
+variable "cluster_settings_hash" {
+  description = "Hash of cluster_settings, as the agent reports it once they are applied."
+  type        = string
+  default     = ""
+}
+
+variable "node_settings" {
+  description = <<-EOT
+    The user's elasticsearch.yml settings (docs/adr/0018), written after the platform's own lines
+    as quoted strings and applied by a rolling restart. Keys the platform owns are refused; the
+    list must match RESERVED_PREFIXES in the backend and RESERVED in scripts/apply-config.sh.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = length(var.node_settings) <= 70
+    error_message = "At most 70 elasticsearch.yml settings."
+  }
+
+  validation {
+    condition     = alltrue([for key in keys(var.node_settings) : can(regex("^[a-z][a-z0-9_]*(\\.[a-z0-9_-]+)+$", key)) && length(key) <= 128])
+    error_message = "node_settings keys must be dotted lowercase setting names."
+  }
+
+  validation {
+    condition = alltrue([for key in keys(var.node_settings) : !anytrue([
+      for prefix in [
+        "xpack.security.", "xpack.license.", "network.", "http.port", "http.host", "http.bind_host",
+        "http.publish_host", "http.publish_port", "transport.", "discovery.", "cluster.initial_master_nodes",
+        "cluster.name", "cluster.routing.allocation.awareness.", "node.name", "node.roles", "node.attr.", "path.",
+        "bootstrap.",
+      ] : endswith(prefix, ".") ? startswith(key, prefix) : (key == prefix || startswith(key, "${prefix}."))
+    ])])
+    error_message = "node_settings must not contain settings the platform manages (security, TLS, network, discovery, paths, node identity, zone awareness)."
+  }
+
+  validation {
+    condition     = alltrue([for value in values(var.node_settings) : length(value) >= 1 && length(value) <= 512 && !can(regex("[\\x00-\\x1f\\x7f]", value))])
+    error_message = "node_settings values must be single-line and at most 512 characters."
+  }
+}
+
+variable "heap_percent" {
+  description = "JVM heap as a share of the VM's memory (capped at 31 GB)."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.heap_percent >= 25 && var.heap_percent <= 75
+    error_message = "heap_percent must be between 25 and 75."
+  }
 }

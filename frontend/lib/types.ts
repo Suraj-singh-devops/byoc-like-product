@@ -4,7 +4,15 @@ export type Role = "OWNER" | "ADMIN" | "OPERATOR" | "VIEWER";
 
 // Lifecycle (what the platform is doing) and health (how the cluster is doing) are separate
 // fields; the console derives one display status from them (docs/adr/0008).
-export type ClusterLifecycle = "CREATING" | "ACTIVE" | "SCALING" | "UPGRADING" | "DELETING" | "FAILED" | "DELETED";
+export type ClusterLifecycle =
+  | "CREATING"
+  | "ACTIVE"
+  | "SCALING"
+  | "UPGRADING"
+  | "UPDATING"
+  | "DELETING"
+  | "FAILED"
+  | "DELETED";
 export type ClusterHealth = "UNKNOWN" | "HEALTHY" | "DEGRADED" | "UNHEALTHY";
 export type NodeLifecycle = "BOOTSTRAPPING" | "ACTIVE" | "DELETED";
 export type NodeHealth = "UNKNOWN" | "HEALTHY" | "UNHEALTHY";
@@ -32,6 +40,7 @@ export type Permission =
   | "cluster:scale"
   | "cluster:delete"
   | "cluster:health_check"
+  | "cluster:configure"
   | "cluster:operate"
   | "operation:read"
   | "operation:manage"
@@ -242,6 +251,61 @@ export interface EngineCatalog {
   min_memory_gb: number;
   default_machine_type: string;
   metrics: { key: string; label: string; unit: string }[];
+  node_groups: NodeGroupDef[];
+  settings: SettingDef[];
+}
+
+// Dedicated layout groups (docs/adr/0016).
+export type ClusterLayout = "combined" | "dedicated";
+export type NodeGroupName = "master" | "data" | "coordinating";
+
+export interface NodeGroupDef {
+  name: NodeGroupName;
+  label: string;
+  min: number;
+  max: number;
+  ha_min: number;
+  default_count: number;
+  default_storage_gb: number;
+  scalable: boolean;
+  description: string;
+}
+
+export interface NodeGroup {
+  name: NodeGroupName;
+  count: number;
+  machine_type: string;
+  storage_gb: number;
+}
+
+// Settings users may change from the platform (docs/adr/0017).
+export type SettingValue = string | number | boolean;
+
+export interface SettingDef {
+  key: string;
+  scope: "dynamic" | "static";
+  kind: "int" | "bool" | "percent" | "bytes" | "enum";
+  default: SettingValue;
+  description: string;
+  minimum: number | null;
+  maximum: number | null;
+  choices: string[];
+  restart_required: boolean;
+}
+
+export interface ClusterConfig {
+  cluster_id: string;
+  settings: SettingDef[];
+  desired: Record<string, SettingValue>;
+  applied: Record<string, SettingValue>;
+  pending: { dynamic: string[]; static: string[] };
+  // Custom elasticsearch.yml settings (docs/adr/0018) and the rendered file per node group.
+  custom: Record<string, string>;
+  config_file: {
+    path: string;
+    files: { group: string; managed: string[]; user: string[] }[];
+    reserved_prefixes: string[];
+  } | null;
 }
 
 export interface EngineMetrics {
@@ -290,6 +354,10 @@ export interface ClusterSummary {
   region: string;
   zone: string;
   zones: string[];
+  layout: ClusterLayout;
+  node_groups: NodeGroup[];
+  // The internal load balancer's HTTPS address (dedicated layout).
+  endpoint: string | null;
   machine_type: string;
   node_count: number;
   storage_gb: number;
@@ -309,6 +377,8 @@ export interface NodeInfo {
   name: string;
   ordinal: number;
   role: string;
+  node_group: NodeGroupName | null;
+  machine_type: string | null;
   zone: string;
   instance_name: string | null;
   instance_id: string | null;

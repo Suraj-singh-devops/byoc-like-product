@@ -1,6 +1,6 @@
 # ADR 0011: Elasticsearch topology and high availability in the MVP
 
-- Status: Accepted
+- Status: Accepted; dedicated node roles added by [ADR 0016](0016-ha-topology-dedicated-roles.md) (2026-09-30)
 - Date: 2026-09-27
 - Related: PRD v2 §7 (no production-grade HA automation), §8 (HA option); TRD v2 §11, §23, §25
 

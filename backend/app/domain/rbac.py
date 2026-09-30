@@ -23,6 +23,8 @@ class Permission(StrEnum):
     CLUSTER_SCALE = "cluster:scale"
     CLUSTER_DELETE = "cluster:delete"
     CLUSTER_HEALTH_CHECK = "cluster:health_check"
+    # Change Elasticsearch settings; static ones restart every node (docs/adr/0017). Owner and Admin.
+    CLUSTER_CONFIGURE = "cluster:configure"
     # Approved engine actions through the agent (e.g. restart) and mock fault injection.
     CLUSTER_OPERATE = "cluster:operate"
     OPERATION_READ = "operation:read"
@@ -76,6 +78,7 @@ OPERATION_PERMISSIONS: dict[OperationType, Permission] = {
     OperationType.SCALE_CLUSTER: Permission.CLUSTER_SCALE,
     OperationType.DELETE_CLUSTER: Permission.CLUSTER_DELETE,
     OperationType.HEALTH_CHECK: Permission.CLUSTER_HEALTH_CHECK,
+    OperationType.UPDATE_CONFIG: Permission.CLUSTER_CONFIGURE,
 }
 
 

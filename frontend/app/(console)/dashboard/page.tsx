@@ -52,7 +52,7 @@ export default function DashboardPage() {
 
   const clusters = data?.clusters ?? [];
   // Health counts cover clusters that exist and are serving; CREATING, FAILED and DELETING are lifecycle states.
-  const serving = clusters.filter((c) => c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING");
+  const serving = clusters.filter((c) => c.lifecycle === "ACTIVE" || c.lifecycle === "SCALING" || c.lifecycle === "UPDATING");
   const count = (health: ClusterHealth) => serving.filter((c) => c.health === health).length;
   const busy = clusters.filter((c) => c.active_operation).length;
   const canCreate = can("cluster:create");

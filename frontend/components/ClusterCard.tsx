@@ -8,7 +8,7 @@ import { Meter, ProgressBar } from "./Meter";
 
 export function ClusterCard({ cluster, now }: { cluster: ClusterSummary; now: number }) {
   const metrics = cluster.metrics ?? {};
-  const active = cluster.lifecycle === "ACTIVE" || cluster.lifecycle === "SCALING";
+  const active = cluster.lifecycle === "ACTIVE" || cluster.lifecycle === "SCALING" || cluster.lifecycle === "UPDATING";
   const op = cluster.active_operation;
   return (
     <article className="card cluster-card">

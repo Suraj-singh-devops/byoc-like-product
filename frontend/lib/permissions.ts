@@ -7,6 +7,7 @@ const OPERATION_PERMISSION: Record<string, Permission> = {
   SCALE_CLUSTER: "cluster:scale",
   DELETE_CLUSTER: "cluster:delete",
   HEALTH_CHECK: "cluster:health_check",
+  UPDATE_CONFIG: "cluster:configure",
 };
 
 export function canManageOperation(can: (permission: Permission) => boolean, operationType: string): boolean {

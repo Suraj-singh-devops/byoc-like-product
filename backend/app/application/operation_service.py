@@ -201,7 +201,7 @@ class OperationService:
             if newer:
                 raise Conflict("A newer operation has run on this cluster since; this one can no longer be retried.")
 
-        if kind in (OperationType.CREATE_CLUSTER, OperationType.SCALE_CLUSTER):
+        if kind in (OperationType.CREATE_CLUSTER, OperationType.SCALE_CLUSTER, OperationType.UPDATE_CONFIG):
             require_connected_account(self.session, cluster)
             require_available_network(self.session, cluster)
         params = dict((op.metadata_ or {}).get("params", {}))
@@ -216,6 +216,11 @@ class OperationService:
             if lifecycle != ClusterLifecycle.ACTIVE:
                 raise Conflict(f"The cluster is {lifecycle} and cannot be scaled now.")
             target = ClusterLifecycle.SCALING
+        elif kind == OperationType.UPDATE_CONFIG:
+            # Resumes the rolling restart where it stopped (nodes already restarted are skipped).
+            if lifecycle != ClusterLifecycle.ACTIVE:
+                raise Conflict(f"The cluster is {lifecycle} and its configuration cannot be changed now.")
+            target = ClusterLifecycle.UPDATING
         elif kind == OperationType.DELETE_CLUSTER:
             target = ClusterLifecycle.DELETING
         elif kind == OperationType.HEALTH_CHECK:

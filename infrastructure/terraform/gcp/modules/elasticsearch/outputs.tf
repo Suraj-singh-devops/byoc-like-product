@@ -58,3 +58,8 @@ output "engine_package" {
     signing_key_fingerprint = var.es_package.signing_key_fingerprint
   }
 }
+
+output "endpoint" {
+  description = "The cluster's single private HTTPS endpoint (internal load balancer), or null without one."
+  value       = local.load_balanced ? "https://${google_compute_address.endpoint[0].address}:9200" : null
+}

@@ -340,3 +340,23 @@ func (c *Client) UndrainNodes(ctx context.Context, clearVoting bool) error {
 	}
 	return nil
 }
+
+// PersistentSettings returns the cluster's persistent settings, flattened, as strings.
+func (c *Client) PersistentSettings(ctx context.Context) (map[string]string, error) {
+	var body struct {
+		Persistent map[string]any `json:"persistent"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/_cluster/settings?flat_settings=true", nil, &body); err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(body.Persistent))
+	for key, value := range body.Persistent {
+		out[key] = fmt.Sprint(value)
+	}
+	return out, nil
+}
+
+// PutPersistentSettings sets (or, for nil values, resets) persistent cluster settings.
+func (c *Client) PutPersistentSettings(ctx context.Context, settings map[string]*string) error {
+	return c.do(ctx, http.MethodPut, "/_cluster/settings?flat_settings=true", map[string]any{"persistent": settings}, nil)
+}

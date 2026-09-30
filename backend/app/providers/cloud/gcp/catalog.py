@@ -9,6 +9,8 @@ from __future__ import annotations
 from app.providers.cloud.base import MachineType, Region, StorageType
 
 REGIONS: tuple[Region, ...] = (
+    Region("asia-east1", ("asia-east1-a", "asia-east1-b", "asia-east1-c"), "Taiwan"),
+    Region("asia-northeast1", ("asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c"), "Tokyo"),
     Region("asia-south1", ("asia-south1-a", "asia-south1-b", "asia-south1-c"), "Mumbai"),
     Region("asia-south2", ("asia-south2-a", "asia-south2-b", "asia-south2-c"), "Delhi"),
     Region("asia-southeast1", ("asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c"), "Singapore"),

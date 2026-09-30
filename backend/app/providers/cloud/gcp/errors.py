@@ -60,7 +60,12 @@ def authentication_failed(reason: str) -> CloudProviderError:
         "GCP authentication failed.",
         code="GCP_AUTHENTICATION_FAILED",
         reason=reason,
-        suggested_action=("Create a new service account key (or fix impersonation) and update the cloud account."),
+        suggested_action=(
+            "Run `gcloud auth application-default login` on the platform host, then validate the account again."
+            if "application-default" in reason or "Reauthentication" in reason
+            else "Check that the platform may impersonate the provisioner service account (roles/"
+            "iam.serviceAccountTokenCreator), then validate the account again. Keys are never used."
+        ),
     )
 
 
@@ -102,7 +107,9 @@ def _classify_text(text: str, project: str) -> PlatformError | None:
             suggested_action="Delete or rename the existing resource, or use a different cluster name.",
         )
     if "invalid_grant" in text or "Invalid JWT Signature" in text:
-        return authentication_failed("The service account key is invalid, disabled or has been deleted.")
+        return authentication_failed(
+            "The platform's Google credentials were rejected (expired, revoked or not allowed to impersonate)."
+        )
     return None
 
 

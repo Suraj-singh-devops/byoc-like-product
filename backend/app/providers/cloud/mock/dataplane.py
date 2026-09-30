@@ -110,6 +110,45 @@ class MockDataPlane:
             s.flush()
             return instance
 
+    def update_config(self, cluster_id: str, node_name: str, config: dict[str, Any]) -> None:
+        """What the agent does with new metadata (docs/adr/0017): live settings take effect at once
+        (the elected master applies them); a new config generation restarts Elasticsearch."""
+        with session_scope(self.session_factory) as s:
+            instance = s.scalar(
+                select(MockInstance).where(
+                    MockInstance.cluster_id == uuid.UUID(cluster_id), MockInstance.node_name == node_name
+                )
+            )
+            if instance is None:
+                return
+            labels = dict(instance.labels or {})
+            restart = labels.get("config_generation", 0) != config.get("config_generation", 0)
+            # Simulated Elasticsearch refuses settings whose name starts with "unknown." at startup,
+            # like a real node refuses an unknown setting; apply-config restores the previous file
+            # (docs/adr/0018, docs/mock-mode.md).
+            unknown = sorted(k for k in config.get("node_settings_keys") or [] if k.startswith("unknown."))
+            if restart and unknown:
+                if labels.get("rejected_generation") == config.get("config_generation"):
+                    return  # the agent never retries a rejected generation
+                labels["rejected_generation"] = config.get("config_generation")
+                labels["rejected_reason"] = (
+                    f"java.lang.IllegalArgumentException: unknown setting [{unknown[0]}] please check that any "
+                    "required plugins are installed, or check the breaking changes documentation for removed settings"
+                )
+                labels["cluster_settings_hash"] = config.get("cluster_settings_hash")
+                instance.labels = labels
+                starting_at = BOOT_TIMELINE[2][0]
+                instance.boot_started_at = utcnow() - timedelta(seconds=starting_at * self.speed)
+                return
+            labels.update(config)
+            if restart:
+                labels.pop("rejected_generation", None)
+                labels.pop("rejected_reason", None)
+            instance.labels = labels
+            if restart:
+                starting_at = BOOT_TIMELINE[2][0]
+                instance.boot_started_at = utcnow() - timedelta(seconds=starting_at * self.speed)
+
     def delete_instance(self, project_id: str, zone: str, name: str) -> None:
         with session_scope(self.session_factory) as s:
             s.execute(
@@ -318,7 +357,23 @@ class MockDataPlane:
             "bootstrap": self._bootstrap(instance, now),
             "system": system,
             "engine": engine,
+            "config": self._config_report(instance, engine),
         }
+
+    @staticmethod
+    def _config_report(instance: MockInstance, engine: dict[str, Any]) -> dict[str, Any]:
+        """The managed settings the node reads back from Elasticsearch, and its applied generation."""
+        labels = instance.labels or {}
+        if not engine.get("reachable") or engine.get("cluster_status") is None:
+            return {}
+        report: dict[str, Any] = {
+            "cluster_settings_hash": labels.get("cluster_settings_hash"),
+            "generation": int(labels.get("config_generation", 0)),
+        }
+        if labels.get("rejected_generation") is not None:
+            report["rejected_generation"] = int(labels["rejected_generation"])
+            report["rejected_reason"] = labels.get("rejected_reason")
+        return report
 
     def _cluster_view(
         self,
@@ -329,10 +384,12 @@ class MockDataPlane:
         phase: float,
         rnd: random.Random,
     ) -> dict[str, Any]:
-        total = len(peers)
         up = [p for p in peers if self._es_up(p, now)]
-        masters = [p for p in peers if _ordinal(p.node_name) <= 3]
+        masters = [p for p in peers if "master" in self._roles(p)]
         masters_up = [p for p in masters if p in up]
+        data = [p for p in peers if "data" in self._roles(p)]
+        data_up = [p for p in data if p in up]
+        total = len(data)
         name = str((instance.labels or {}).get("cluster_name", "cluster"))
         view: dict[str, Any] = {"reachable": True, "cluster_name": name, "node_roles": self._roles(instance)}
         if len(masters_up) * 2 <= len(masters):
@@ -345,19 +402,24 @@ class MockDataPlane:
             )
             return view
 
-        allocation = {p.node_name: SHARDS_PER_NODE for p in up}
+        # Only data nodes hold shards (coordinating and dedicated master nodes hold none).
+        allocation = {p.node_name: SHARDS_PER_NODE for p in data_up}
         primaries = SHARDS_PER_NODE * total // 2
-        unassigned = 0 if len(up) == total and total > 1 else max(0, primaries - SHARDS_PER_NODE * (len(up) - 1))
+        unassigned = (
+            0 if len(data_up) == total and total > 1 else max(0, primaries - SHARDS_PER_NODE * (len(data_up) - 1))
+        )
         if total == 1:
-            unassigned = primaries  # replicas of a single-node cluster can never be assigned
-        status = "green" if unassigned == 0 else "yellow"
-        elected = min(masters_up, key=lambda p: _ordinal(p.node_name))
+            unassigned = primaries  # replicas of a single data node can never be assigned
+        if not data_up:
+            unassigned = SHARDS_PER_NODE * total
+        status = "green" if unassigned == 0 else ("red" if not data_up else "yellow")
+        elected = min(masters_up, key=lambda p: int((p.labels or {}).get("ordinal", _ordinal(p.node_name))))
         docs = int(1_250_000 + (zlib.crc32(name.encode()) % 500_000) + (t % 86400) * 3)
         view.update(
             {
                 "cluster_status": status,
                 "number_of_nodes": len(up),
-                "number_of_data_nodes": len(up),
+                "number_of_data_nodes": len(data_up),
                 "active_shards": sum(allocation.values()),
                 "unassigned_shards": unassigned,
                 "relocating_shards": 0,
@@ -377,4 +439,7 @@ class MockDataPlane:
 
     @staticmethod
     def _roles(instance: MockInstance) -> list[str]:
+        roles = (instance.labels or {}).get("roles")
+        if roles is not None:
+            return list(roles)
         return ["master", "data", "ingest"] if _ordinal(instance.node_name) <= 3 else ["data", "ingest"]

@@ -107,6 +107,7 @@ The single source of truth is
 | Network lookup | `compute.networks.get`, `compute.subnetworks.get`, `compute.routers.list` | Read-only checks of the registered network; move to the read-only monitor role in P4 |
 | Compute | `compute.instances.*` (create, delete, get, list, setMetadata, setServiceAccount, setTags, setLabels, attach/detachDisk, start, stop, getGuestAttributes) | VMs and reading their status/guest attributes |
 | Storage | `compute.disks.*` (create, delete, get, use, setLabels, resize) | Data disks |
+| Load balancer | `compute.addresses.*` (internal), `compute.instanceGroups.*`, `compute.instances.use`, `compute.regionHealthChecks.*`, `compute.regionBackendServices.*`, `compute.forwardingRules.*` | The dedicated layout's internal load balancer (one private IP on 9200) |
 | Catalog | `compute.machineTypes/zones/regions.get,list`, `compute.projects.get`, `compute.*Operations.get` | Validation and Terraform polling |
 | IAM | `iam.serviceAccounts.create/delete/get/update/actAs` | Node service account and attaching it to VMs |
 | Secrets | `secretmanager.secrets.*`, `secretmanager.versions.add/get/access/destroy` | CA, node certificate/key, elastic password; per-secret access for the node SA |
@@ -124,8 +125,8 @@ its cluster's secrets and artifacts bucket.
   creates or changes it. Shared VPC is not supported yet.
 - The subnet needs outbound HTTPS to `artifacts.elastic.co` (Cloud NAT or a proxy) and Private
   Google Access for Secret Manager and Cloud Storage; missing ones are shown as warnings.
-- VMs have no external IPs. Clients reach the private endpoints (`https://<node-ip>:9200`) from
-  the registered subnet; other ranges need firewall rules you add (client ranges per network are
+- VMs have no external IPs. Clients reach the private endpoints (`https://<node-ip>:9200`, or
+  the internal load balancer's address with the dedicated layout) from the registered subnet; other ranges need firewall rules you add (client ranges per network are
   planned).
 - Clusters created before P1b keep their dedicated VPC ([ADR 0006](adr/0006-dedicated-vpc-per-cluster.md)).
 - The platform itself never connects to the VMs or to Elasticsearch; it uses Google APIs only.
@@ -134,6 +135,7 @@ its cluster's secrets and artifacts bucket.
 
 One or two firewall rules in your registered network (scoped to the cluster's network tag), a node
 service account, four Secret Manager secrets, a private GCS bucket with the agent binary, one data
-disk per node, and one VM per node, running exactly the catalog version of Elasticsearch
+disk per node, one VM per node (with the dedicated layout: an internal address, instance groups,
+a health check, a backend service, a forwarding rule and a health-check firewall rule), running exactly the catalog version of Elasticsearch
 (9.5.4). Everything is labelled `managed-by=byoc` and `byoc-cluster-id=<id>`, and removed by
 **Delete**.

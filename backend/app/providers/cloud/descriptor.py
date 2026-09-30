@@ -60,18 +60,31 @@ class CloudDescriptor(ABC):
     def storage_types(self) -> list[StorageType]:
         return list(self.storage_catalog)
 
-    def validate_placement(self, region: str, zone: str, machine_type: str) -> MachineType:
-        """Static check at request time; the terraform-runner verifies placement in the real account."""
-        region_info = next((r for r in self.regions if r.name == region), None)
-        if region_info is None:
-            raise ValidationFailed(
-                f"Region {region} is not available.", details={"fields": {"region": "Unknown region."}}
-            )
-        if zone not in region_info.zones:
-            raise ValidationFailed(
-                f"Zone {zone} does not exist in region {region}.",
-                details={"fields": {"zone": f"Choose one of {', '.join(region_info.zones)}."}},
-            )
+    def validate_placement(
+        self, region: str, zone: str, machine_type: str, known_zones: list[str] | tuple[str, ...] | None = None
+    ) -> MachineType:
+        """Static check at request time; the terraform-runner verifies placement in the real account.
+
+        ``known_zones`` are the zones of a registered network, looked up in the customer's cloud
+        (docs/adr/0013). They are authoritative: the static region list is only a fallback and
+        does not have to list every region."""
+        if known_zones:
+            if zone not in known_zones:
+                raise ValidationFailed(
+                    f"Zone {zone} is not available in this network.",
+                    details={"fields": {"zone": f"Choose one of {', '.join(known_zones)}."}},
+                )
+        else:
+            region_info = next((r for r in self.regions if r.name == region), None)
+            if region_info is None:
+                raise ValidationFailed(
+                    f"Region {region} is not available.", details={"fields": {"region": "Unknown region."}}
+                )
+            if zone not in region_info.zones:
+                raise ValidationFailed(
+                    f"Zone {zone} does not exist in region {region}.",
+                    details={"fields": {"zone": f"Choose one of {', '.join(region_info.zones)}."}},
+                )
         machine = next((m for m in self.machine_types if m.name == machine_type), None)
         if machine is None:
             raise ValidationFailed(

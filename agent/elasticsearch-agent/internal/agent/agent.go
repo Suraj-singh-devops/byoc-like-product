@@ -11,6 +11,7 @@ import (
 
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/commands"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/config"
+	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/configsync"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/controlplane"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/elasticsearch"
 	"github.com/byoc-platform/byoc/agent/elasticsearch-agent/internal/guestattr"
@@ -34,6 +35,7 @@ type Agent struct {
 	Identity  identity.Source
 	Control   *controlplane.Client
 	Publisher *guestattr.Publisher
+	Sync      *configsync.Syncer
 	Log       *slog.Logger
 	Now       func() time.Time
 
@@ -73,6 +75,16 @@ func New(cfg *config.Config, version string, log *slog.Logger) (*Agent, error) {
 	if cfg.GuestAttributes {
 		a.Publisher = &guestattr.Publisher{MetadataURL: cfg.MetadataURL}
 	}
+	if cfg.ConfigSync {
+		a.Sync = &configsync.Syncer{
+			Metadata:   &configsync.GCEMetadata{URL: cfg.MetadataURL},
+			Engine:     es,
+			Apply:      configsync.ApplyConfigCommand(cfg.ApplyConfigPath),
+			StateFile:  cfg.ConfigStateFile,
+			FailedFile: cfg.ConfigFailedFile,
+			Log:        log,
+		}
+	}
 	return a, nil
 }
 
@@ -93,9 +105,17 @@ func (a *Agent) Collect(ctx context.Context) report.Report {
 	}
 }
 
-// Once runs a single cycle: collect, publish to guest attributes, heartbeat, run commands.
+// Once runs a single cycle: collect, apply configuration, publish to guest attributes,
+// heartbeat, run commands.
 func (a *Agent) Once(ctx context.Context) error {
 	rep := a.Collect(ctx)
+	if a.Sync != nil && rep.Engine.Reachable {
+		status, restarted := a.Sync.Sync(ctx, rep.Engine.IsMaster)
+		if restarted {
+			rep = a.Collect(ctx)
+		}
+		rep.Config = &status
+	}
 	var errs []error
 	if a.Publisher != nil {
 		payload, err := json.Marshal(rep)

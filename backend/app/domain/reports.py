@@ -51,3 +51,5 @@ class NodeReport(BaseModel):
     bootstrap: BootstrapInfo | None = None
     system: SystemMetrics = Field(default_factory=SystemMetrics)
     engine: dict[str, Any] = Field(default_factory=dict)
+    # What the agent applied (docs/adr/0017): {"cluster_settings_hash": str, "generation": int}.
+    config: dict[str, Any] = Field(default_factory=dict)
